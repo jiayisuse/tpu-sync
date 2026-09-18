@@ -1517,6 +1517,48 @@ TEST_F(RaidenControllerTest, TransferBackendBuffersDispatchesOffloadAndRecall) {
   EXPECT_THAT(mock_mgr.last_backend_dst_block_ids, ElementsAre(4));
 }
 
+TEST_F(RaidenControllerTest,
+       TransferBackendBuffersDispatchesOffloadAndRecallWithTdsBackend) {
+  kv_cache::BackendConfig tds_cfg;
+  tds_cfg.type = "tds";
+  tds_cfg.parallelism.tp_rank = 0;
+  tds_cfg.parallelism.tp_size = 1;
+  tds_cfg.SetProperty("tp_size", "1");
+
+  MockTransferManager mock_mgr;
+  mock_mgr.RegisterKVBackends({tds_cfg});
+  test_server_->service->SetTransferManager(KVManagerHolder(&mock_mgr));
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto controller,
+      RaidenController::Create(unit_, /*num_blocks=*/5, /*num_shards=*/1,
+                               /*shard_size_bytes=*/512, ""));
+  RegisterAndInitWorker(*controller, "worker_0", test_server_->server_address);
+
+  ::tpu_sync::proto::BackendTransferSpec backend_spec;
+  backend_spec.set_name("tds");
+
+  auto offload_status = controller->TransferBackendBuffers(
+      ::tpu_sync::proto::TRANSFER_DIR_OFFLOAD, {"tds_block0"},
+      /*hbm_block_ids=*/{2}, /*host_block_ids=*/{3}, {backend_spec});
+  EXPECT_TRUE(offload_status.Await().ok());
+  EXPECT_EQ(mock_mgr.d2h_write_to_backend_calls, 1);
+  ASSERT_EQ(mock_mgr.last_d2h_backend_keys.size(), 1);
+  EXPECT_EQ(mock_mgr.last_d2h_backend_keys[0].block_hash, "tds_block0");
+  EXPECT_THAT(mock_mgr.last_d2h_backend_keys[0].resolved_key,
+              HasSubstr("7464735f626c6f636b30.bin"));  // hex("tds_block0")
+
+  auto recall_status = controller->TransferBackendBuffers(
+      ::tpu_sync::proto::TRANSFER_DIR_RECALL, {"tds_recall0"},
+      /*hbm_block_ids=*/{4}, /*host_block_ids=*/{1}, {backend_spec});
+  EXPECT_TRUE(recall_status.Await().ok());
+  EXPECT_EQ(mock_mgr.h2d_read_from_backend_calls, 1);
+  ASSERT_EQ(mock_mgr.last_h2d_backend_keys.size(), 1);
+  EXPECT_EQ(mock_mgr.last_h2d_backend_keys[0].block_hash, "tds_recall0");
+  EXPECT_THAT(mock_mgr.last_h2d_backend_keys[0].resolved_key,
+              HasSubstr("7464735f726563616c6c30.bin"));  // hex("tds_recall0")
+}
+
 TEST_F(RaidenControllerTest, TransferBuffersBackendSpecValidationRejections) {
   MockTransferManager mock_mgr;
   test_server_->service->SetTransferManager(KVManagerHolder(&mock_mgr));

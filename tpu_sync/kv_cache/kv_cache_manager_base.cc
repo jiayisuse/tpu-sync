@@ -63,6 +63,7 @@
 #include "tpu_sync/core/tpu_utils.h"
 #include "tpu_sync/kv_cache/backends/backend.h"
 #include "tpu_sync/kv_cache/backends/storage/posix_backend.h"
+#include "tpu_sync/kv_cache/backends/storage/tds_backend.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend_factory.h"
 #include "tpu_sync/kv_cache/logical_block_manager.h"
 #include "tpu_sync/kv_cache/pool_layout.h"
@@ -3231,8 +3232,11 @@ bool KVCacheManagerBase::InitializeSingleSecondaryBackend(
     const BackendConfig& config) {
   if (config.type.empty()) return false;
 
-  if (!absl::EqualsIgnoreCase(config.type,
-                              backends::storage::kPosixBackendName)) {
+  const bool is_posix =
+      absl::EqualsIgnoreCase(config.type, backends::storage::kPosixBackendName);
+  const bool is_tds =
+      absl::EqualsIgnoreCase(config.type, backends::storage::kTdsBackendName);
+  if (!is_posix && !is_tds) {
     LOG(WARNING) << "[Worker] Unsupported secondary backend: " << config.type;
     return false;
   }
@@ -3244,14 +3248,40 @@ bool KVCacheManagerBase::InitializeSingleSecondaryBackend(
   }
 
   const std::string canonical_name =
-      std::string(backends::storage::kPosixBackendName);
+      std::string(is_tds ? backends::storage::kTdsBackendName
+                         : backends::storage::kPosixBackendName);
   if (GetKVBackend(canonical_name) != nullptr) return false;
 
   auto props = config.properties;
   props["tp_size"] = absl::StrCat(config.parallelism.tp_size);
   props["tp_rank"] = absl::StrCat(config.parallelism.tp_rank);
-  auto backend = std::make_shared<backends::storage::PosixKVBackend>(
-      canonical_name, props);
+  std::shared_ptr<backends::KVBackend> backend;
+  if (is_tds) {
+    auto tds_backend =
+        std::make_shared<backends::storage::TdsKVBackend>(canonical_name, props);
+    // Pre-register [dram: User host_buf] pool regions so that both
+    // `require_registration = true` validation and future io_uring fixed-buffer
+    // pinning have the entire host staging arena registered up front.
+    for (size_t l = 0; l < num_layers_; ++l) {
+      const size_t n_blocks =
+          (explicit_pools_ && l < pools_.size()) ? pools_[l].num_blocks : 0;
+      const size_t stride =
+          (explicit_pools_ && l < pools_.size())
+              ? static_cast<size_t>(pools_[l].block_stride_bytes)
+              : block_bytes(l);
+      if (n_blocks == 0 || stride == 0) continue;
+      for (size_t s = 0; s < num_shards_; ++s) {
+        uint8_t* base = GetBlockHostPointer(l, s, 0);
+        if (base != nullptr) {
+          (void)tds_backend->RegisterBuffer(base, n_blocks * stride);
+        }
+      }
+    }
+    backend = std::move(tds_backend);
+  } else {
+    backend = std::make_shared<backends::storage::PosixKVBackend>(
+        canonical_name, props);
+  }
   {
     absl::MutexLock lock(backends_mu_);
     backends_[canonical_name] = std::move(backend);
