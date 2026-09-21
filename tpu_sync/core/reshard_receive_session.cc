@@ -495,13 +495,10 @@ void ReshardReceiveSession::EndRecvOp() {
   EndRecvOpLocked();
 }
 
-bool ReshardReceiveSession::TakePendingUnregister(uint64_t* generation) {
+bool ReshardReceiveSession::TakePendingUnregister() {
   absl::MutexLock lock(mu_);
   if (!unregister_on_settle_) return false;
   unregister_on_settle_ = false;
-  if (generation != nullptr) {
-    *generation = 0;
-  }
   return true;
 }
 

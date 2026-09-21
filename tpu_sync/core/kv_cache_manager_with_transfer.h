@@ -312,10 +312,6 @@ class KVCacheManagerWithTransfer {
   // published without its staging owner or torn down against a half-built
   // registration.
   absl::Mutex plan_lifecycle_mu_;
-  // Source of plan generations: the uuid names a transfer, a generation
-  // names one registration of it (the same uuid may come back, e.g. on a
-  // retry of the same transfer).
-  uint64_t plan_generation_counter_ ABSL_GUARDED_BY(plan_lifecycle_mu_) = 0;
   // Host staging held by a plan: a sender's, or a receiver's whose
   // destination is host memory. Released when the plan is unregistered.
   absl::flat_hash_map<uint64_t, StagingAllocation> plan_staging_
@@ -373,9 +369,8 @@ class KVCacheManagerWithTransfer {
 
   void InitializeBaseHooks();
   void InitializeControlPlane();
-  // Drops the plan of a receive that has settled; a plan already gone, or
-  // a newer registration reusing the uuid, is left alone.
-  void UnregisterSettledPlan(uint64_t uuid, uint64_t generation);
+  // Drops the plan of a receive that has settled.
+  void UnregisterSettledPlan(uint64_t uuid);
   void MaybeUnregisterSettledRecv(uint64_t uuid,
                                   TransferReceiveSession& session);
   absl::StatusOr<PullStreamResponseSpec> HandlePullStream(

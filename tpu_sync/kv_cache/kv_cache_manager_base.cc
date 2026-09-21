@@ -2289,6 +2289,18 @@ bool KVCacheManagerBase::AcceptsPlanlessExplicitPush(uint64_t uuid) const {
   return active_plans_.contains(uuid);
 }
 
+absl::Status KVCacheManagerBase::BeginIncomingPush(uint64_t uuid) {
+  return transfer_hooks_.begin_incoming_push
+             ? transfer_hooks_.begin_incoming_push(uuid)
+             : absl::OkStatus();
+}
+
+absl::Status KVCacheManagerBase::EndIncomingPush(uint64_t uuid) {
+  return transfer_hooks_.end_incoming_push
+             ? transfer_hooks_.end_incoming_push(uuid)
+             : absl::OkStatus();
+}
+
 absl::StatusOr<std::optional<tpu_raiden::transport::PoolPushProgressSpec>>
 KVCacheManagerBase::GetPoolPushProgressSpec(size_t pool_idx,
                                             uint64_t uuid) const {
@@ -2730,8 +2742,7 @@ absl::StatusOr<std::vector<HostBlockId>> KVCacheManagerBase::PlanHostBlocks(
 absl::Status KVCacheManagerBase::RegisterActivePlan(
     uint64_t uuid, const ::tpu_sync::rpc::StartTransferRequest& request,
     bool is_sender,
-    absl::flat_hash_map<DeviceBlockId, HostBlockId> host_block_of,
-    uint64_t generation) {
+    absl::flat_hash_map<DeviceBlockId, HostBlockId> host_block_of) {
   // Structural contract for pool-addressed plans. Pool selection is request
   // data resolved by the controller; raiden validates consistency (indices
   // resolve against this manager's pool table, explicit or implicit) and
@@ -2795,9 +2806,9 @@ absl::Status KVCacheManagerBase::RegisterActivePlan(
   }
   absl::MutexLock l(plans_mu_);
   if (auto [it, inserted] = active_plans_.try_emplace(
-          uuid, std::make_shared<const RegisteredPlan>(RegisteredPlan{
-                    request, is_sender, std::move(host_block_of),
-                    std::move(staged_device_blocks), generation}));
+          uuid, std::make_shared<const RegisteredPlan>(
+                    RegisteredPlan{request, is_sender, std::move(host_block_of),
+                                   std::move(staged_device_blocks)}));
       !inserted) {
     return absl::AlreadyExistsError(
         absl::StrCat("Plan with UUID ", uuid, " is already registered!"));

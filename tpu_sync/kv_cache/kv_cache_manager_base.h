@@ -186,6 +186,8 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
         register_active_plan;
     std::function<absl::Status(uint64_t uuid)> unregister_active_plan;
     std::function<int64_t()> get_node_id;
+    std::function<absl::Status(uint64_t uuid)> begin_incoming_push;
+    std::function<absl::Status(uint64_t uuid)> end_incoming_push;
   };
 
   void SetTransferEventHooks(TransferEventHooks hooks) {
@@ -533,6 +535,8 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
       std::optional<uint64_t> uuid = std::nullopt);
 
   bool AcceptsPlanlessExplicitPush(uint64_t uuid) const override;
+  absl::Status BeginIncomingPush(uint64_t uuid) override;
+  absl::Status EndIncomingPush(uint64_t uuid) override;
 
   absl::StatusOr<std::optional<tpu_raiden::transport::PoolPushProgressSpec>>
   GetPoolPushProgressSpec(size_t pool_idx, uint64_t uuid) const override;
@@ -550,13 +554,10 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   // Same, with the plan's device blocks staged in explicitly chosen host
   // blocks instead of at their own ids: `host_block_of` maps each device
   // block id the plan names on this side to the host block staging it.
-  // `generation` identifies this registration among transfers that reuse
-  // the same uuid (e.g. a retry); see RegisteredPlan::generation.
   absl::Status RegisterActivePlan(
       uint64_t uuid, const ::tpu_sync::rpc::StartTransferRequest& request,
       bool is_sender,
-      absl::flat_hash_map<DeviceBlockId, HostBlockId> host_block_of,
-      uint64_t generation = 0);
+      absl::flat_hash_map<DeviceBlockId, HostBlockId> host_block_of);
 
   virtual absl::Status UnregisterActivePlan(uint64_t uuid);
   absl::Status UnregisterActivePlanDirect(uint64_t uuid);
@@ -565,14 +566,6 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   bool HasActivePlan(uint64_t uuid) const {
     absl::MutexLock l(plans_mu_);
     return active_plans_.contains(uuid);
-  }
-
-  // The generation of the plan registered under `uuid`, if any.
-  std::optional<uint64_t> ActivePlanGeneration(uint64_t uuid) const {
-    absl::MutexLock l(plans_mu_);
-    auto it = active_plans_.find(uuid);
-    if (it == active_plans_.end()) return std::nullopt;
-    return it->second->generation;
   }
 
   // Host blocks staging `block_ids` under plan `uuid`: the ids themselves
@@ -835,12 +828,6 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
     // Device blocks the plan's schedules name on this side; the set
     // PlanHostBlocks() answers for.
     absl::flat_hash_set<int64_t> staged_device_blocks;
-    // Extension of the uuid for when the same uuid names more than one
-    // transfer over time (e.g. a retry of the same transfer): each
-    // registration gets its own generation, so cleanup queued for an old
-    // registration cannot touch a newer one under the same uuid. 0 when
-    // the caller keeps no generations; cleanup then matches by uuid alone.
-    uint64_t generation = 0;
   };
   // Plans are stored behind shared_ptr so the per-push readers
   // (GetBlockChunks / GetPoolPushProgressSpec) snapshot with a refcount bump

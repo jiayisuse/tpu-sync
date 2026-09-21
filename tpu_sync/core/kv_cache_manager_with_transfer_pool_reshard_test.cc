@@ -38,6 +38,7 @@
 #include "tpu_sync/core/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/core/reshard_receive_session.h"
 #include "tpu_sync/core/reshard_send_session.h"
+#include "tpu_sync/core/transfer_receive_session.h"
 #include "tpu_sync/kv_cache/pool_layout.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
@@ -101,6 +102,13 @@ class TestManager : public KVCacheManagerWithTransfer {
     staging_allocator_ = StagingBlockAllocator::Create(
         base_.get(), staging_allocator_->num_slots(),
         staging_allocator_->max_blocks(), /*dynamic_host_staging=*/true);
+  }
+  void FinishRecvSessionForTest(uint64_t uuid) {
+    absl::MutexLock lock(mu_);
+    auto it = active_recv_sessions_.find(uuid);
+    if (it != active_recv_sessions_.end()) {
+      it->second->Finish();
+    }
   }
 };
 
@@ -523,6 +531,44 @@ TEST(DemandStagingTest, DemandStagedReceiverPlanUnregistersWhenItSettles) {
   EXPECT_THAT(failed_recving, Contains("block_plan_req_27"));
   EXPECT_EQ(manager.base()->PlanHostBlocks(27, {2, 3}).status().code(),
             absl::StatusCode::kNotFound);
+  EXPECT_EQ(pool->num_free_blocks(), free_before);
+  EXPECT_EQ(pool->num_locked_blocks(), 0);
+}
+
+TEST(DemandStagingTest,
+     UnregisteringSettledReceiverDoesNotUnregisterReusedUuidOnCompleteReadRaw) {
+  TestManager manager;
+  manager.EnableDemandStaging();
+  manager.AttachPlaceholderDeviceHold();
+  auto* pool = manager.base()->host_block_manager();
+  const int free_before = pool->num_free_blocks();
+
+  ASSERT_TRUE(manager
+                  .RegisterActivePlan(
+                      29, BlockPlan(29, {0, 1}, {2, 3}, MEMORY_TYPE_HBM),
+                      /*is_sender=*/false)
+                  .ok());
+  manager.FinishRecvSessionForTest(29);
+  ASSERT_TRUE(manager.UnregisterActivePlan(29).ok());
+  EXPECT_FALSE(manager.base()->HasActivePlan(29));
+
+  // Re-register a new plan with the same UUID before CompleteReadRaw reaps the
+  // settled receive session.
+  ASSERT_TRUE(manager
+                  .RegisterActivePlan(
+                      29, BlockPlan(29, {0, 1}, {2, 3}, MEMORY_TYPE_HBM),
+                      /*is_sender=*/true)
+                  .ok());
+  ASSERT_TRUE(manager.base()->PlanHostBlocks(29, {0, 1}).ok());
+
+  const auto [done_sending, done_recving, failed_recving] =
+      manager.CompleteReadRaw();
+  EXPECT_THAT(done_recving, Contains("block_plan_req_29"));
+  EXPECT_TRUE(manager.base()->HasActivePlan(29));
+  EXPECT_TRUE(manager.base()->PlanHostBlocks(29, {0, 1}).ok());
+
+  ASSERT_TRUE(manager.UnregisterActivePlan(29).ok());
+  EXPECT_FALSE(manager.base()->HasActivePlan(29));
   EXPECT_EQ(pool->num_free_blocks(), free_before);
   EXPECT_EQ(pool->num_locked_blocks(), 0);
 }

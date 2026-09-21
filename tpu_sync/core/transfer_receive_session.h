@@ -71,7 +71,7 @@ class TransferReceiveSession
   CreateFromActivePlan(
       kv_cache::KVCacheManagerBase* base,
       StagingBlockAllocator* absl_nullable staging_allocator, uint64_t uuid,
-      const ::tpu_sync::rpc::StartTransferRequest& request, uint64_t generation,
+      const ::tpu_sync::rpc::StartTransferRequest& request,
       std::chrono::steady_clock::time_point deadline,
       absl::flat_hash_map<kv_cache::DeviceBlockId, kv_cache::HostBlockId>*
           host_block_of);
@@ -106,14 +106,21 @@ class TransferReceiveSession
 
   void ReleaseStaging();
 
+  bool TryBeginRecvOp() {
+    absl::MutexLock lock(mu_);
+    if (done_ || draining_) return false;
+    ++in_flight_;
+    return true;
+  }
+  void EndRecvOp();
+
   // Marks the plan to be unregistered when the receive settles, returning true
   // if the receive is still active and will unregister on settle, or false if
   // it is already done.
   bool DeferUnregisterOnSettle();
 
-  // Atomically claims any pending settle-unregister request and writes its
-  // plan generation to |generation|.
-  bool TakePendingUnregister(uint64_t* generation);
+  // Atomically claims any pending settle-unregister request.
+  bool TakePendingUnregister();
 
   // Returns true if network/layer transfer is complete and all H2D futures are
   // ready.
@@ -176,7 +183,7 @@ class TransferReceiveSession
   // Initializes this receive session for an HBM destination active plan,
   // allocating dynamic host staging via |staging_allocator_| when enabled.
   absl::Status InitFromActivePlan(
-      const ::tpu_sync::rpc::StartTransferRequest& request, uint64_t generation,
+      const ::tpu_sync::rpc::StartTransferRequest& request,
       std::chrono::steady_clock::time_point deadline,
       absl::flat_hash_map<kv_cache::DeviceBlockId, kv_cache::HostBlockId>*
           host_block_of);
@@ -206,10 +213,6 @@ class TransferReceiveSession
   void FinishLocked(const absl::Status& status = absl::OkStatus())
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   void EndRecvOpLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
-
-  // Decrements the count of in-flight operations; marks the receive done and
-  // releases its staging resources if it was draining and waiting for this op.
-  void EndRecvOp();
 
   bool AllH2dDoneLocked() const ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   bool RecordBlocksReceivedLocked(const std::vector<int>& block_ids,
@@ -248,9 +251,6 @@ class TransferReceiveSession
   // flight (the plan stays mapped until then so late pushes resolve
   // through its blocks).
   bool unregister_on_settle_ ABSL_GUARDED_BY(mu_) = false;
-  // Generation of the plan this receive belongs to; settlement cleanup
-  // only touches that registration.
-  uint64_t plan_generation_ ABSL_GUARDED_BY(mu_) = 0;
 };
 
 }  // namespace tpu_raiden

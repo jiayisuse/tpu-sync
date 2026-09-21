@@ -122,7 +122,7 @@ absl::StatusOr<std::shared_ptr<TransferReceiveSession>>
 TransferReceiveSession::CreateFromActivePlan(
     kv_cache::KVCacheManagerBase* base,
     StagingBlockAllocator* absl_nullable staging_allocator, uint64_t uuid,
-    const ::tpu_sync::rpc::StartTransferRequest& request, uint64_t generation,
+    const ::tpu_sync::rpc::StartTransferRequest& request,
     std::chrono::steady_clock::time_point deadline,
     absl::flat_hash_map<kv_cache::DeviceBlockId, kv_cache::HostBlockId>*
         host_block_of) {
@@ -131,13 +131,13 @@ TransferReceiveSession::CreateFromActivePlan(
   }
   auto session = std::shared_ptr<TransferReceiveSession>(
       new TransferReceiveSession(base, staging_allocator, uuid));
-  ABSL_RETURN_IF_ERROR(session->InitFromActivePlan(request, generation,
-                                                   deadline, host_block_of));
+  ABSL_RETURN_IF_ERROR(
+      session->InitFromActivePlan(request, deadline, host_block_of));
   return session;
 }
 
 absl::Status TransferReceiveSession::InitFromActivePlan(
-    const ::tpu_sync::rpc::StartTransferRequest& request, uint64_t generation,
+    const ::tpu_sync::rpc::StartTransferRequest& request,
     std::chrono::steady_clock::time_point deadline,
     absl::flat_hash_map<kv_cache::DeviceBlockId, kv_cache::HostBlockId>*
         host_block_of) {
@@ -168,7 +168,6 @@ absl::Status TransferReceiveSession::InitFromActivePlan(
     }
   }
   unregister_on_settle_ = !staging_.empty();
-  plan_generation_ = generation;
   req_id_ = request.req_id().empty()
                 ? absl::StrCat("resharded_transfer_", uuid_)
                 : request.req_id();
@@ -405,13 +404,10 @@ bool TransferReceiveSession::DeferUnregisterOnSettle() {
   return true;
 }
 
-bool TransferReceiveSession::TakePendingUnregister(uint64_t* generation) {
+bool TransferReceiveSession::TakePendingUnregister() {
   absl::MutexLock lock(mu_);
   if (!unregister_on_settle_) return false;
   unregister_on_settle_ = false;
-  if (generation != nullptr) {
-    *generation = plan_generation_;
-  }
   return true;
 }
 
@@ -607,7 +603,6 @@ absl::Status TransferReceiveSession::ExecuteLayerH2d(
     bool all_layers_done = false;
     std::chrono::steady_clock::time_point session_start_time;
     bool should_unregister = false;
-    uint64_t generation = 0;
     {
       absl::MutexLock lock(self->mu_);
       if (self->done_) {
@@ -634,7 +629,6 @@ absl::Status TransferReceiveSession::ExecuteLayerH2d(
       if (self->draining_ && self->in_flight_ == 1 &&
           self->unregister_on_settle_) {
         self->unregister_on_settle_ = false;
-        generation = self->plan_generation_;
         should_unregister = true;
       }
     }
@@ -650,7 +644,7 @@ absl::Status TransferReceiveSession::ExecuteLayerH2d(
       }
     }
     if (should_unregister && !manager.IsShuttingDown()) {
-      manager.UnregisterSettledPlan(uuid, generation);
+      manager.UnregisterSettledPlan(uuid);
     }
   });
 
