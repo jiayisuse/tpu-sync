@@ -65,6 +65,30 @@ jobs:
       # inside this ephemeral container.
       - name: Fix Git Workspace Ownership
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE/tpu-sync"
+      - name: Prepare fork-only Torch mocks
+        if: ${{ github.repository == 'jiayisuse/tpu-sync' }}
+        run: |
+          python3 -m pip install --index-url https://download.pytorch.org/whl/cpu torch==2.11.0
+          torch_source="$(python3 -c 'import pathlib, torch; print(pathlib.Path(torch.__file__).resolve().parent.parent)')"
+          echo "TORCH_SOURCE=${torch_source}" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/torch_tpu_stub/torch_tpu/include/csrc/api"
+          cat > "$RUNNER_TEMP/torch_tpu_stub/torch_tpu/include/csrc/api/tensor_buffer.h" <<'EOF'
+          #ifndef TORCH_TPU_CSRC_API_TENSOR_BUFFER_H_
+          #define TORCH_TPU_CSRC_API_TENSOR_BUFFER_H_
+          namespace torch_tpu {
+          class TensorBufferHandle {
+           public:
+            TensorBufferHandle() = default;
+            TensorBufferHandle(const TensorBufferHandle&) = default;
+            TensorBufferHandle(TensorBufferHandle&&) = default;
+            TensorBufferHandle& operator=(const TensorBufferHandle&) = default;
+            TensorBufferHandle& operator=(TensorBufferHandle&&) = default;
+            ~TensorBufferHandle() = default;
+          };
+          }  // namespace torch_tpu
+          #endif  // TORCH_TPU_CSRC_API_TENSOR_BUFFER_H_
+          EOF
+          echo "TORCH_TPU_SOURCE=$RUNNER_TEMP/torch_tpu_stub" >> "$GITHUB_ENV"
       - name: Run CPU unit tests, E2E JAX build, and binding verification
         working-directory: tpu-sync
         run: |
