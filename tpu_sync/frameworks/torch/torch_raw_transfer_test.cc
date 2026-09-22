@@ -17,12 +17,12 @@
 #include <memory>
 #include <vector>
 
+#include "torch/torch.h"
+#include "tpu_sync/frameworks/torch/torch_tpu_utils_mock.h"
 #include "xla/pjrt/pjrt_client.h"
 #include "xla/pjrt/plugin/xla_cpu/xla_cpu_pjrt_client.h"
 #include "xla/tsl/platform/statusor.h"
 #include "xla/tsl/platform/test.h"
-#include "tpu_sync/frameworks/torch/torch_tpu_utils_mock.h"
-#include "torch/torch.h"
 
 namespace raiden {
 namespace {
@@ -152,6 +152,95 @@ TEST_F(TorchRawTransferTest, BatchTransferD2HAndH2D) {
 
   for (int i = 0; i < 256; ++i) {
     EXPECT_EQ(readback_data[i], 24.0f);
+  }
+}
+
+TEST_F(TorchRawTransferTest, PreparedBatchPartialD2HAndH2D) {
+  TF_ASSERT_OK_AND_ASSIGN(xla::PjRtMemorySpace * memory_space,
+                          device_->default_memory_space());
+  constexpr int64_t kMajor = 4;
+  constexpr int64_t kRows = 32;
+  constexpr int64_t kCols = 32;
+  constexpr int64_t kSliceElements = kRows * kCols;
+  constexpr int64_t kElements = kMajor * kSliceElements;
+
+  std::vector<float> first(kElements);
+  std::vector<float> second(kElements);
+  for (int64_t i = 0; i < kElements; ++i) {
+    first[i] = static_cast<float>(i);
+    second[i] = static_cast<float>(10000 + i);
+  }
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto first_buffer, client_->BufferFromHostBuffer(
+                             first.data(), xla::F32, {kMajor, kRows, kCols},
+                             /*byte_strides=*/std::nullopt,
+                             xla::PjRtClient::HostBufferSemantics::
+                                 kImmutableUntilTransferCompletes,
+                             /*on_done_with_host_buffer=*/nullptr, memory_space,
+                             /*device_layout=*/nullptr));
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto second_buffer,
+      client_->BufferFromHostBuffer(
+          second.data(), xla::F32, {kMajor, kRows, kCols},
+          /*byte_strides=*/std::nullopt,
+          xla::PjRtClient::HostBufferSemantics::
+              kImmutableUntilTransferCompletes,
+          /*on_done_with_host_buffer=*/nullptr, memory_space,
+          /*device_layout=*/nullptr));
+
+  at::Tensor first_tpu =
+      ::torch::zeros({kMajor, kRows, kCols}, ::torch::kFloat32);
+  at::Tensor second_tpu =
+      ::torch::zeros({kMajor, kRows, kCols}, ::torch::kFloat32);
+  RegisterMockTensor(first_tpu, first_buffer.get());
+  RegisterMockTensor(second_tpu, second_buffer.get());
+  at::Tensor first_host =
+      ::torch::zeros({kMajor, kRows, kCols}, ::torch::kFloat32);
+  at::Tensor second_host =
+      ::torch::zeros({kMajor, kRows, kCols}, ::torch::kFloat32);
+
+  auto transfer = std::make_shared<PreparedTorchRawTransferBatch>(
+      std::vector<at::Tensor>{first_tpu, second_tpu},
+      std::vector<at::Tensor>{first_host, second_host},
+      /*unsafe_skip_buffer_lock=*/true);
+  EXPECT_EQ(transfer->Size(), 2);
+
+  // Copy TPU page 1 into host page 2 for both tensors.
+  ASSERT_OK(transfer
+                ->D2HAsync(/*src_offsets_major_dim=*/{1},
+                           /*dst_offsets_major_dim=*/{2},
+                           /*copy_sizes_major_dim=*/{1})
+                .Await());
+  const float* first_host_data = first_host.data_ptr<float>();
+  const float* second_host_data = second_host.data_ptr<float>();
+  for (int64_t i = 0; i < kSliceElements; ++i) {
+    EXPECT_EQ(first_host_data[2 * kSliceElements + i],
+              first[kSliceElements + i]);
+    EXPECT_EQ(second_host_data[2 * kSliceElements + i],
+              second[kSliceElements + i]);
+  }
+
+  // Copy the staged host page into TPU page 3, then verify with PJRT.
+  first_host.slice(0, 2, 3).fill_(7.0f);
+  second_host.slice(0, 2, 3).fill_(9.0f);
+  ASSERT_OK(transfer
+                ->H2DAsync(/*src_offsets_major_dim=*/{2},
+                           /*dst_offsets_major_dim=*/{3},
+                           /*copy_sizes_major_dim=*/{1})
+                .Await());
+  std::vector<float> first_readback(kElements);
+  std::vector<float> second_readback(kElements);
+  ASSERT_OK(
+      first_buffer
+          ->CopyRawToHost(first_readback.data(), 0, kElements * sizeof(float))
+          .Await());
+  ASSERT_OK(
+      second_buffer
+          ->CopyRawToHost(second_readback.data(), 0, kElements * sizeof(float))
+          .Await());
+  for (int64_t i = 0; i < kSliceElements; ++i) {
+    EXPECT_EQ(first_readback[3 * kSliceElements + i], 7.0f);
+    EXPECT_EQ(second_readback[3 * kSliceElements + i], 9.0f);
   }
 }
 

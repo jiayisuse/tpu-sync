@@ -22,8 +22,8 @@
 
 #include "ATen/core/TensorBody.h"
 #include "csrc/api/tensor_buffer.h"
-#include "xla/pjrt/pjrt_client.h"
 #include "tpu_sync/core/raw_transfer_core.h"
+#include "xla/pjrt/pjrt_client.h"
 
 namespace raiden {
 
@@ -67,6 +67,53 @@ class PreparedTorchRawTransfer
   std::optional<torch_tpu::TensorBufferHandle> buffer_ref_;
   size_t physical_size_ = 0;
   RaidenBufferHandle buffer_;
+};
+
+// Prepared partial-copy engine for a fixed set of TPU and host tensors.
+//
+// Unlike Transfer{D2H,H2D}BatchAsync, construction resolves and materializes
+// every TPU tensor exactly once. Subsequent copies reuse the retained base
+// storage references and raw PJRT buffer aliases, which is important for hot
+// KV-cache paths that submit many small partial transfers against the same
+// long-lived tensors.
+//
+// Host tensors are retained for this object's lifetime and must be contiguous
+// CPU tensors. Pinned tensors avoid libtpu's pageable-memory staging fallback.
+// When unsafe_skip_buffer_lock is false, a fresh PJRT usage hold is acquired
+// for each submitted copy and retained by its future until completion. When it
+// is true, only the owning tensor-buffer reference is retained.
+class PreparedTorchRawTransferBatch
+    : public std::enable_shared_from_this<PreparedTorchRawTransferBatch> {
+ public:
+  PreparedTorchRawTransferBatch(const std::vector<at::Tensor>& tpu_tensors,
+                                const std::vector<at::Tensor>& host_tensors,
+                                bool unsafe_skip_buffer_lock);
+
+  size_t Size() const;
+  std::vector<size_t> PhysicalSizeBytes() const;
+
+  PjRtCopyFuture D2HAsync(const std::vector<int64_t>& src_offsets_major_dim,
+                          const std::vector<int64_t>& dst_offsets_major_dim,
+                          const std::vector<int64_t>& copy_sizes_major_dim);
+  PjRtCopyFuture H2DAsync(const std::vector<int64_t>& src_offsets_major_dim,
+                          const std::vector<int64_t>& dst_offsets_major_dim,
+                          const std::vector<int64_t>& copy_sizes_major_dim);
+
+ private:
+  struct PreparedBuffer {
+    RaidenBufferHandle buffer;
+    std::optional<torch_tpu::TensorBufferHandle> buffer_ref;
+    size_t physical_size = 0;
+    size_t slice_byte_size = 0;
+    int64_t major_dim_size = 0;
+  };
+
+  RaidenBufferHandle BufferForCopy(const PreparedBuffer& prepared) const;
+
+  std::vector<PreparedBuffer> prepared_buffers_;
+  std::vector<at::Tensor> tpu_tensors_;
+  std::vector<at::Tensor> host_tensors_;
+  bool unsafe_skip_buffer_lock_ = false;
 };
 
 // Raw device<->host DMA over torch tensors, mirroring the JAX-side

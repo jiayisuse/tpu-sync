@@ -124,6 +124,29 @@ void BindTorchRawTransfer(nb::module_& m) {
       .def("h2d", &PreparedTorchRawTransfer::H2D,
            nb::call_guard<nb::gil_scoped_release>());
 
+  nb::class_<PreparedTorchRawTransferBatch>(m, "PreparedTorchRawTransferBatch")
+      .def(nb::new_([](const TensorList& tpu_tensors,
+                       const TensorList& host_tensors,
+                       bool unsafe_skip_buffer_lock) {
+             return std::make_shared<PreparedTorchRawTransferBatch>(
+                 tpu_tensors, host_tensors, unsafe_skip_buffer_lock);
+           }),
+           nb::arg("tpu_tensors"), nb::arg("host_tensors"),
+           nb::arg("unsafe_skip_buffer_lock") = true)
+      .def("__len__", &PreparedTorchRawTransferBatch::Size)
+      .def_prop_ro("physical_size_bytes",
+                   &PreparedTorchRawTransferBatch::PhysicalSizeBytes)
+      .def("d2h_async", &PreparedTorchRawTransferBatch::D2HAsync,
+           nb::arg("src_offsets_major_dim") = std::vector<int64_t>{},
+           nb::arg("dst_offsets_major_dim") = std::vector<int64_t>{},
+           nb::arg("copy_sizes_major_dim") = std::vector<int64_t>{},
+           nb::call_guard<nb::gil_scoped_release>())
+      .def("h2d_async", &PreparedTorchRawTransferBatch::H2DAsync,
+           nb::arg("src_offsets_major_dim") = std::vector<int64_t>{},
+           nb::arg("dst_offsets_major_dim") = std::vector<int64_t>{},
+           nb::arg("copy_sizes_major_dim") = std::vector<int64_t>{},
+           nb::call_guard<nb::gil_scoped_release>());
+
   m.def("await_all", &AwaitAll, nb::arg("futures"));
   m.def("is_ready", &IsReady, nb::arg("futures"));
 
@@ -148,10 +171,9 @@ void BindTorchRawTransfer(nb::module_& m) {
          const std::vector<int64_t>& dst_offsets_major_dim,
          const std::vector<int64_t>& copy_sizes_major_dim,
          bool unsafe_skip_buffer_lock) {
-        auto future = TransferD2HAsync(src_arr, dst_arr, src_offsets_major_dim,
-                                       dst_offsets_major_dim,
-                                       copy_sizes_major_dim,
-                                       unsafe_skip_buffer_lock);
+        auto future = TransferD2HAsync(
+            src_arr, dst_arr, src_offsets_major_dim, dst_offsets_major_dim,
+            copy_sizes_major_dim, unsafe_skip_buffer_lock);
         absl::Status status = future.Await();
         if (!status.ok()) {
           throw std::runtime_error(std::string("Async copy failed: ") +
@@ -171,10 +193,9 @@ void BindTorchRawTransfer(nb::module_& m) {
          const std::vector<int64_t>& dst_offsets_major_dim,
          const std::vector<int64_t>& copy_sizes_major_dim,
          bool unsafe_skip_buffer_lock) {
-        auto future = TransferH2DAsync(src_arr, dst_arr, src_offsets_major_dim,
-                                       dst_offsets_major_dim,
-                                       copy_sizes_major_dim,
-                                       unsafe_skip_buffer_lock);
+        auto future = TransferH2DAsync(
+            src_arr, dst_arr, src_offsets_major_dim, dst_offsets_major_dim,
+            copy_sizes_major_dim, unsafe_skip_buffer_lock);
         absl::Status status = future.Await();
         if (!status.ok()) {
           throw std::runtime_error(std::string("Async copy failed: ") +

@@ -30,17 +30,17 @@
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
 #include "c10/core/Device.h"
-#include "torch/headeronly/core/DeviceType.h"
 #include "csrc/api/tensor_buffer.h"
+#include "torch/headeronly/core/DeviceType.h"
+#include "tpu_sync/core/host_memory_allocator.h"
+#include "tpu_sync/core/raw_transfer_core.h"
+#include "tpu_sync/core/utils.h"
+#include "tpu_sync/frameworks/torch/torch_tpu_utils.h"
 #include "xla/future.h"
 #include "xla/layout.h"
 #include "xla/pjrt/pjrt_client.h"
 #include "xla/shape.h"
 #include "xla/shape_util.h"
-#include "tpu_sync/core/host_memory_allocator.h"
-#include "tpu_sync/core/raw_transfer_core.h"
-#include "tpu_sync/core/utils.h"
-#include "tpu_sync/frameworks/torch/torch_tpu_utils.h"
 
 namespace raiden {
 namespace {
@@ -488,6 +488,184 @@ void PreparedTorchRawTransfer::H2D() {
   if (!status.ok()) {
     ThrowStatus("H2D copy failed", status);
   }
+}
+
+PreparedTorchRawTransferBatch::PreparedTorchRawTransferBatch(
+    const TensorList& tpu_tensors, const TensorList& host_tensors,
+    bool unsafe_skip_buffer_lock)
+    : tpu_tensors_(tpu_tensors),
+      host_tensors_(host_tensors),
+      unsafe_skip_buffer_lock_(unsafe_skip_buffer_lock) {
+  if (tpu_tensors_.empty()) {
+    throw std::invalid_argument("tpu_tensors must not be empty");
+  }
+  if (tpu_tensors_.size() != host_tensors_.size()) {
+    throw std::invalid_argument(
+        "Lengths of tpu_tensors and host_tensors must match");
+  }
+
+  prepared_buffers_.reserve(tpu_tensors_.size());
+  for (size_t i = 0; i < tpu_tensors_.size(); ++i) {
+    ValidateCpuTensor(host_tensors_[i], "Host");
+
+    // Resolve the live base storage exactly once. The cached handle itself is
+    // deliberately acquired without a usage hold. Safe mode reacquires a
+    // per-copy hold in BufferForCopy(), so the hold ends with the DMA future
+    // instead of accidentally blocking compute for this object's lifetime.
+    auto unpacked =
+        UnpackTorchTensor(tpu_tensors_[i], /*unsafe_skip_buffer_lock=*/true);
+    AwaitReady(unpacked.buffer.buffer, "TPU tensor");
+    if (unpacked.logical_dimensions.empty() ||
+        unpacked.logical_dimensions[0] <= 0 ||
+        unpacked.logical_slice_byte_size == 0) {
+      throw std::invalid_argument(
+          "TPU tensor must expose a non-empty logical major dimension");
+    }
+    prepared_buffers_.push_back(PreparedBuffer{
+        .buffer = std::move(unpacked.buffer),
+        .buffer_ref = std::move(unpacked.ref),
+        .physical_size = unpacked.logical_physical_size,
+        .slice_byte_size = unpacked.logical_slice_byte_size,
+        .major_dim_size = unpacked.logical_dimensions[0],
+    });
+  }
+}
+
+size_t PreparedTorchRawTransferBatch::Size() const {
+  return prepared_buffers_.size();
+}
+
+std::vector<size_t> PreparedTorchRawTransferBatch::PhysicalSizeBytes() const {
+  std::vector<size_t> sizes;
+  sizes.reserve(prepared_buffers_.size());
+  for (const auto& prepared : prepared_buffers_) {
+    sizes.push_back(prepared.physical_size);
+  }
+  return sizes;
+}
+
+RaidenBufferHandle PreparedTorchRawTransferBatch::BufferForCopy(
+    const PreparedBuffer& prepared) const {
+  if (unsafe_skip_buffer_lock_) {
+    return prepared.buffer;
+  }
+  if (prepared.buffer.buffer == nullptr) {
+    throw std::runtime_error(
+        "Prepared TPU buffer cannot acquire a per-copy usage hold");
+  }
+  return ValueOrThrow(
+      "Failed to acquire TPU buffer for prepared copy",
+      RaidenBufferHandle::Acquire(prepared.buffer.buffer,
+                                  /*c_api=*/nullptr,
+                                  /*extension=*/nullptr,
+                                  /*unsafe_skip_buffer_lock=*/false));
+}
+
+PjRtCopyFuture PreparedTorchRawTransferBatch::D2HAsync(
+    const std::vector<int64_t>& src_offsets_major_dim,
+    const std::vector<int64_t>& dst_offsets_major_dim,
+    const std::vector<int64_t>& copy_sizes_major_dim) {
+  tpu_raiden::ValidatePartialSpec(src_offsets_major_dim, dst_offsets_major_dim,
+                                  copy_sizes_major_dim);
+  const bool is_partial = !src_offsets_major_dim.empty();
+  std::vector<PjRtCopyFuture> futures;
+  futures.reserve(prepared_buffers_.size());
+  auto self = shared_from_this();
+
+  for (size_t i = 0; i < prepared_buffers_.size(); ++i) {
+    const PreparedBuffer& prepared = prepared_buffers_[i];
+    RaidenBufferHandle buffer = BufferForCopy(prepared);
+    const size_t host_size = host_tensors_[i].nbytes();
+    uint8_t* host_ptr = reinterpret_cast<uint8_t*>(host_tensors_[i].data_ptr());
+    std::vector<tpu_raiden::D2hCopy> copies;
+    if (!is_partial) {
+      if (host_size < prepared.physical_size) {
+        throw std::invalid_argument(
+            "Host tensor is smaller than the prepared TPU buffer");
+      }
+      copies.push_back(
+          {host_ptr, 0, static_cast<int64_t>(prepared.physical_size)});
+    } else {
+      copies.reserve(src_offsets_major_dim.size());
+      for (size_t j = 0; j < src_offsets_major_dim.size(); ++j) {
+        const int64_t src = src_offsets_major_dim[j];
+        const int64_t dst = dst_offsets_major_dim[j];
+        const int64_t count = copy_sizes_major_dim[j];
+        const int64_t host_major_dim =
+            static_cast<int64_t>(host_size / prepared.slice_byte_size);
+        if (src < 0 || dst < 0 || count < 0 ||
+            count > prepared.major_dim_size || count > host_major_dim ||
+            src > prepared.major_dim_size - count ||
+            dst > host_major_dim - count) {
+          throw std::out_of_range("Prepared D2H copy range is out of bounds");
+        }
+        copies.push_back(
+            {host_ptr + static_cast<size_t>(dst) * prepared.slice_byte_size,
+             src * static_cast<int64_t>(prepared.slice_byte_size),
+             count * static_cast<int64_t>(prepared.slice_byte_size)});
+      }
+    }
+    PjRtCopyFuture future =
+        ValueOrThrow("Failed to submit prepared D2H copy",
+                     tpu_raiden::IssueD2hShard(buffer, copies));
+    future.AddKeepAlive(self);
+    futures.push_back(std::move(future));
+  }
+  return JoinPjRtCopyFutures(absl::MakeSpan(futures));
+}
+
+PjRtCopyFuture PreparedTorchRawTransferBatch::H2DAsync(
+    const std::vector<int64_t>& src_offsets_major_dim,
+    const std::vector<int64_t>& dst_offsets_major_dim,
+    const std::vector<int64_t>& copy_sizes_major_dim) {
+  tpu_raiden::ValidatePartialSpec(src_offsets_major_dim, dst_offsets_major_dim,
+                                  copy_sizes_major_dim);
+  const bool is_partial = !src_offsets_major_dim.empty();
+  std::vector<PjRtCopyFuture> futures;
+  futures.reserve(prepared_buffers_.size());
+  auto self = shared_from_this();
+
+  for (size_t i = 0; i < prepared_buffers_.size(); ++i) {
+    const PreparedBuffer& prepared = prepared_buffers_[i];
+    RaidenBufferHandle buffer = BufferForCopy(prepared);
+    const size_t host_size = host_tensors_[i].nbytes();
+    const uint8_t* host_ptr =
+        reinterpret_cast<const uint8_t*>(host_tensors_[i].data_ptr());
+    std::vector<tpu_raiden::H2dCopy> copies;
+    if (!is_partial) {
+      if (host_size < prepared.physical_size) {
+        throw std::invalid_argument(
+            "Host tensor is smaller than the prepared TPU buffer");
+      }
+      copies.push_back(
+          {host_ptr, 0, static_cast<int64_t>(prepared.physical_size)});
+    } else {
+      copies.reserve(src_offsets_major_dim.size());
+      for (size_t j = 0; j < src_offsets_major_dim.size(); ++j) {
+        const int64_t src = src_offsets_major_dim[j];
+        const int64_t dst = dst_offsets_major_dim[j];
+        const int64_t count = copy_sizes_major_dim[j];
+        const int64_t host_major_dim =
+            static_cast<int64_t>(host_size / prepared.slice_byte_size);
+        if (src < 0 || dst < 0 || count < 0 ||
+            count > prepared.major_dim_size || count > host_major_dim ||
+            dst > prepared.major_dim_size - count ||
+            src > host_major_dim - count) {
+          throw std::out_of_range("Prepared H2D copy range is out of bounds");
+        }
+        copies.push_back(
+            {host_ptr + static_cast<size_t>(src) * prepared.slice_byte_size,
+             dst * static_cast<int64_t>(prepared.slice_byte_size),
+             count * static_cast<int64_t>(prepared.slice_byte_size)});
+      }
+    }
+    PjRtCopyFuture future =
+        ValueOrThrow("Failed to submit prepared H2D copy",
+                     tpu_raiden::IssueH2dShard(buffer, copies));
+    future.AddKeepAlive(self);
+    futures.push_back(std::move(future));
+  }
+  return JoinPjRtCopyFutures(absl::MakeSpan(futures));
 }
 
 }  // namespace raiden
