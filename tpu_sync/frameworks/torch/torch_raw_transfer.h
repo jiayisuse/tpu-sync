@@ -88,6 +88,9 @@ class PreparedTorchRawTransferBatch
   PreparedTorchRawTransferBatch(const std::vector<at::Tensor>& tpu_tensors,
                                 const std::vector<at::Tensor>& host_tensors,
                                 bool unsafe_skip_buffer_lock);
+  PreparedTorchRawTransferBatch(const PreparedTorchRawTransferBatch&) = delete;
+  PreparedTorchRawTransferBatch& operator=(
+      const PreparedTorchRawTransferBatch&) = delete;
 
   size_t Size() const;
   std::vector<size_t> PhysicalSizeBytes() const;
