@@ -577,7 +577,7 @@ PjRtCopyFuture PreparedTorchRawTransferBatch::D2HAsync(
     RaidenBufferHandle buffer = BufferForCopy(prepared);
     const size_t host_size = host_tensors_[i].nbytes();
     uint8_t* host_ptr = reinterpret_cast<uint8_t*>(host_tensors_[i].data_ptr());
-    std::vector<tpu_raiden::D2hCopy> copies;
+    std::vector<D2hCopy> copies;
     if (!is_partial) {
       if (host_size < prepared.physical_size) {
         throw std::invalid_argument(
@@ -607,7 +607,7 @@ PjRtCopyFuture PreparedTorchRawTransferBatch::D2HAsync(
     }
     PjRtCopyFuture future =
         ValueOrThrow("Failed to submit prepared D2H copy",
-                     tpu_raiden::IssueD2hShard(buffer, copies));
+                     IssueD2hShard(buffer, copies));
     future.AddKeepAlive(self);
     futures.push_back(std::move(future));
   }
@@ -631,7 +631,7 @@ PjRtCopyFuture PreparedTorchRawTransferBatch::H2DAsync(
     const size_t host_size = host_tensors_[i].nbytes();
     const uint8_t* host_ptr =
         reinterpret_cast<const uint8_t*>(host_tensors_[i].data_ptr());
-    std::vector<tpu_raiden::H2dCopy> copies;
+    std::vector<H2dCopy> copies;
     if (!is_partial) {
       if (host_size < prepared.physical_size) {
         throw std::invalid_argument(
@@ -661,7 +661,7 @@ PjRtCopyFuture PreparedTorchRawTransferBatch::H2DAsync(
     }
     PjRtCopyFuture future =
         ValueOrThrow("Failed to submit prepared H2D copy",
-                     tpu_raiden::IssueH2dShard(buffer, copies));
+                     IssueH2dShard(buffer, copies));
     future.AddKeepAlive(self);
     futures.push_back(std::move(future));
   }
