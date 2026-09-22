@@ -514,7 +514,11 @@ PreparedTorchRawTransferBatch::PreparedTorchRawTransferBatch(
     // instead of accidentally blocking compute for this object's lifetime.
     auto unpacked =
         UnpackTorchTensor(tpu_tensors_[i], /*unsafe_skip_buffer_lock=*/true);
-    AwaitReady(unpacked.buffer.buffer, "TPU tensor");
+    // Do not await the buffer's content-ready future here. Prefill KV storage is
+    // deliberately allocated before it has been populated, so construction-time
+    // readiness would deadlock server startup. UnpackTorchTensor has already
+    // materialized the backing storage and resolved its PjRtBuffer; each raw DMA
+    // operation carries its own completion future.
     if (unpacked.logical_dimensions.empty() ||
         unpacked.logical_dimensions[0] <= 0 ||
         unpacked.logical_slice_byte_size == 0) {
