@@ -94,4 +94,6 @@ jobs:
         run: |
           export BAZEL_CACHE_DIR="${RUNNER_TEMP}/bazel_cache"
           export BAZEL_OUTPUT_BASE="${BAZEL_CACHE_DIR}/output_base"
-          bash ci/run_unit_tests.sh
+          # Personal-fork validation branch: build the nanobind extension
+          # directly so its overloads are compiled even without TPU hardware.
+          bash ci/run_unit_tests.sh //tpu_sync/frameworks/torch:_torch_raw_transfer
