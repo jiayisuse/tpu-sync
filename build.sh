@@ -282,6 +282,7 @@ PY
   BAZEL_TARGETS+=(
     "//tpu_sync/frameworks/torch:_tpu_raiden_host"
     "//tpu_sync/frameworks/torch:_tpu_raiden_torch"
+    "//tpu_sync/frameworks/torch:_torch_raw_transfer"
   )
 else
   DEFINE_FLAGS+=" --define with_torch=false"
@@ -378,6 +379,10 @@ if [ "$BUILD_TORCH" = true ]; then
          "(e.g., 'sudo apt-get install -y patchelf') and rebuild." >&2
     exit 1
   fi
+
+  RAW_TRANSFER_SO="${WORKSPACE_DIR}/tpu_sync/frameworks/torch/_torch_raw_transfer.so"
+  cp -f "${WORKSPACE_DIR}/bazel-bin/tpu_sync/frameworks/torch/_torch_raw_transfer.so" \
+    "${RAW_TRANSFER_SO}"
 fi
 
 
