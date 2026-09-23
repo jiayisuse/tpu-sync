@@ -1,0 +1,33 @@
+load("@bazel_skylib//rules:common_settings.bzl", "bool_flag")
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+load("@rules_python//python:py_library.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+bool_flag(
+    name = "local_torch",
+    build_setting_default = True,
+)
+
+cc_library(
+    name = "aten_headers",
+    deps = ["@local_torch//:torch_headers"],
+)
+
+cc_library(
+    name = "torch_headers",
+    deps = [
+        "@local_torch//:torch_headers",
+        "@rules_python//python/cc:current_py_cc_headers",
+    ],
+)
+
+cc_library(
+    name = "torch",
+    deps = [":torch_headers"],
+)
+
+py_library(
+    name = "pytorch",
+    deps = ["@local_torch//:torch"],
+)

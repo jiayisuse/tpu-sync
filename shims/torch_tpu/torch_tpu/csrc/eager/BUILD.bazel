@@ -1,0 +1,33 @@
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "device_buffer",
+    hdrs = ["device_buffer.h"],
+    deps = [
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/types:span",
+        "@xla//xla/pjrt:pjrt_client",
+    ],
+)
+
+cc_library(
+    name = "materialize",
+    hdrs = ["materialize.h"],
+    deps = [
+        ":device_buffer",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/types:span",
+    ],
+)
+
+cc_library(
+    name = "tensor_to_buffer",
+    hdrs = ["tensor_to_buffer.h"],
+    deps = [
+        ":device_buffer",
+        "//shims/torch:aten_headers",
+        "@com_google_absl//absl/status:statusor",
+    ],
+)

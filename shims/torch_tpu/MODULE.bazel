@@ -1,0 +1,13 @@
+module(name = "torch_tpu", version = "0.1.1")
+
+bazel_dep(name = "rules_cc", version = "0.2.9")
+bazel_dep(name = "rules_python", version = "1.8.5")
+bazel_dep(name = "nanobind_bazel", version = "2.12.0")
+bazel_dep(name = "bazel_skylib", version = "1.7.1")
+bazel_dep(name = "protobuf", version = "32.1", repo_name = "com_google_protobuf")
+bazel_dep(name = "abseil-cpp", version = "20260526.0", repo_name = "com_google_absl")
+bazel_dep(name = "xla")
+
+torch_local_repo = use_repo_rule("//bazel:torch_local_repo.bzl", "torch_local_repo")
+
+torch_local_repo(name = "local_torch")
