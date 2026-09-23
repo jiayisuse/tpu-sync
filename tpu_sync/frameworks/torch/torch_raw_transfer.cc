@@ -136,6 +136,36 @@ void RawHostBuffer::EnsureBoundToDevice(xla::PjRtDevice* device) {
   data_ptr_ = data_.get();
 }
 
+void RawHostBuffer::EnsureDmaMappedToDevice(xla::PjRtDevice* device) {
+  if (data_ptr_ != nullptr || size_bytes_ == 0) {
+    return;
+  }
+  if (device == nullptr) {
+    throw std::invalid_argument("Cannot DMA-map RawHostBuffer to null device");
+  }
+  auto allocator_or = tpu_raiden::HostMemoryAllocator::Create(device->client());
+  if (!allocator_or.ok()) {
+    throw std::runtime_error("Failed to create TPU DMA host allocator: " +
+                             allocator_or.status().ToString());
+  }
+  auto allocator = std::move(allocator_or).value();
+  auto status_or_alloc =
+      allocator->AllocateDmaMappedForDevice(size_bytes_, device);
+  if (!status_or_alloc.ok()) {
+    throw std::runtime_error("Failed to allocate TPU DMA-mapped host buffer: " +
+                             status_or_alloc.status().ToString());
+  }
+  auto alloc = std::move(status_or_alloc).value();
+  auto* ctx = new std::shared_ptr<tpu_raiden::HostBufferAllocation>(
+      std::make_shared<tpu_raiden::HostBufferAllocation>(std::move(alloc)));
+  data_ = c10::DataPtr((*ctx)->ptr, ctx, &DeleteHostBufferAllocation,
+                       c10::Device(c10::DeviceType::CPU));
+  if (data_.get() == nullptr) {
+    throw std::runtime_error("Failed to allocate TPU DMA-mapped host buffer");
+  }
+  data_ptr_ = data_.get();
+}
+
 namespace {
 [[noreturn]] void ThrowStatus(absl::string_view context,
                               const absl::Status& status) {
@@ -504,9 +534,39 @@ PreparedTorchRawTransferBatch::PreparedTorchRawTransferBatch(
         "Lengths of tpu_tensors and host_tensors must match");
   }
 
+  PrepareBuffers();
+}
+
+PreparedTorchRawTransferBatch::PreparedTorchRawTransferBatch(
+    const TensorList& tpu_tensors,
+    const std::vector<int64_t>& host_buffer_sizes_bytes,
+    bool unsafe_skip_buffer_lock)
+    : tpu_tensors_(tpu_tensors),
+      unsafe_skip_buffer_lock_(unsafe_skip_buffer_lock) {
+  if (tpu_tensors_.empty()) {
+    throw std::invalid_argument("tpu_tensors must not be empty");
+  }
+  if (tpu_tensors_.size() != host_buffer_sizes_bytes.size()) {
+    throw std::invalid_argument(
+        "Lengths of tpu_tensors and host_buffer_sizes_bytes must match");
+  }
+  host_buffers_.reserve(host_buffer_sizes_bytes.size());
+  for (int64_t size_bytes : host_buffer_sizes_bytes) {
+    if (size_bytes <= 0) {
+      throw std::invalid_argument(
+          "host_buffer_sizes_bytes must contain only positive values");
+    }
+    host_buffers_.push_back(std::make_shared<RawHostBuffer>(size_bytes));
+  }
+  PrepareBuffers();
+}
+
+void PreparedTorchRawTransferBatch::PrepareBuffers() {
   prepared_buffers_.reserve(tpu_tensors_.size());
   for (size_t i = 0; i < tpu_tensors_.size(); ++i) {
-    ValidateCpuTensor(host_tensors_[i], "Host");
+    if (!host_tensors_.empty()) {
+      ValidateCpuTensor(host_tensors_[i], "Host");
+    }
 
     // Resolve the live base storage exactly once. The cached handle itself is
     // deliberately acquired without a usage hold. Safe mode reacquires a
@@ -514,6 +574,9 @@ PreparedTorchRawTransferBatch::PreparedTorchRawTransferBatch(
     // instead of accidentally blocking compute for this object's lifetime.
     auto unpacked =
         UnpackTorchTensor(tpu_tensors_[i], /*unsafe_skip_buffer_lock=*/true);
+    if (!host_buffers_.empty()) {
+      host_buffers_[i]->EnsureDmaMappedToDevice(unpacked.buffer.device);
+    }
     // Do not await the buffer's content-ready future here. Prefill KV storage is
     // deliberately allocated before it has been populated, so construction-time
     // readiness would deadlock server startup. UnpackTorchTensor has already
@@ -548,6 +611,45 @@ std::vector<size_t> PreparedTorchRawTransferBatch::PhysicalSizeBytes() const {
   return sizes;
 }
 
+std::vector<uintptr_t> PreparedTorchRawTransferBatch::HostDataPtrs() const {
+  std::vector<uintptr_t> pointers;
+  pointers.reserve(tpu_tensors_.size());
+  for (size_t i = 0; i < tpu_tensors_.size(); ++i) {
+    pointers.push_back(reinterpret_cast<uintptr_t>(MutableHostData(i)));
+  }
+  return pointers;
+}
+
+std::vector<size_t> PreparedTorchRawTransferBatch::HostSizeBytes() const {
+  std::vector<size_t> sizes;
+  sizes.reserve(tpu_tensors_.size());
+  for (size_t i = 0; i < tpu_tensors_.size(); ++i) {
+    sizes.push_back(HostSize(i));
+  }
+  return sizes;
+}
+
+uint8_t* PreparedTorchRawTransferBatch::MutableHostData(size_t index) const {
+  if (!host_buffers_.empty()) {
+    return static_cast<uint8_t*>(host_buffers_[index]->MutableData());
+  }
+  return reinterpret_cast<uint8_t*>(host_tensors_[index].data_ptr());
+}
+
+const uint8_t* PreparedTorchRawTransferBatch::HostData(size_t index) const {
+  if (!host_buffers_.empty()) {
+    return static_cast<const uint8_t*>(host_buffers_[index]->Data());
+  }
+  return reinterpret_cast<const uint8_t*>(host_tensors_[index].data_ptr());
+}
+
+size_t PreparedTorchRawTransferBatch::HostSize(size_t index) const {
+  if (!host_buffers_.empty()) {
+    return host_buffers_[index]->SizeBytes();
+  }
+  return host_tensors_[index].nbytes();
+}
+
 RaidenBufferHandle PreparedTorchRawTransferBatch::BufferForCopy(
     const PreparedBuffer& prepared) const {
   if (unsafe_skip_buffer_lock_) {
@@ -579,8 +681,8 @@ PjRtCopyFuture PreparedTorchRawTransferBatch::D2HAsync(
   for (size_t i = 0; i < prepared_buffers_.size(); ++i) {
     const PreparedBuffer& prepared = prepared_buffers_[i];
     RaidenBufferHandle buffer = BufferForCopy(prepared);
-    const size_t host_size = host_tensors_[i].nbytes();
-    uint8_t* host_ptr = reinterpret_cast<uint8_t*>(host_tensors_[i].data_ptr());
+    const size_t host_size = HostSize(i);
+    uint8_t* host_ptr = MutableHostData(i);
     std::vector<D2hCopy> copies;
     if (!is_partial) {
       if (host_size < prepared.physical_size) {
@@ -632,9 +734,8 @@ PjRtCopyFuture PreparedTorchRawTransferBatch::H2DAsync(
   for (size_t i = 0; i < prepared_buffers_.size(); ++i) {
     const PreparedBuffer& prepared = prepared_buffers_[i];
     RaidenBufferHandle buffer = BufferForCopy(prepared);
-    const size_t host_size = host_tensors_[i].nbytes();
-    const uint8_t* host_ptr =
-        reinterpret_cast<const uint8_t*>(host_tensors_[i].data_ptr());
+    const size_t host_size = HostSize(i);
+    const uint8_t* host_ptr = HostData(i);
     std::vector<H2dCopy> copies;
     if (!is_partial) {
       if (host_size < prepared.physical_size) {

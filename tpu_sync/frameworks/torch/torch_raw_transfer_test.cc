@@ -244,5 +244,61 @@ TEST_F(TorchRawTransferTest, PreparedBatchPartialD2HAndH2D) {
   }
 }
 
+TEST_F(TorchRawTransferTest, PreparedBatchOwnsDmaMappedHostBuffers) {
+  TF_ASSERT_OK_AND_ASSIGN(xla::PjRtMemorySpace * memory_space,
+                          device_->default_memory_space());
+  constexpr int64_t kMajor = 4;
+  constexpr int64_t kRows = 32;
+  constexpr int64_t kCols = 32;
+  constexpr int64_t kSliceElements = kRows * kCols;
+  constexpr int64_t kElements = kMajor * kSliceElements;
+  constexpr int64_t kBytes = kElements * sizeof(float);
+
+  std::vector<float> initial(kElements);
+  for (int64_t i = 0; i < kElements; ++i) {
+    initial[i] = static_cast<float>(i);
+  }
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto device_buffer,
+      client_->BufferFromHostBuffer(
+          initial.data(), xla::F32, {kMajor, kRows, kCols},
+          /*byte_strides=*/std::nullopt,
+          xla::PjRtClient::HostBufferSemantics::kImmutableUntilTransferCompletes,
+          /*on_done_with_host_buffer=*/nullptr, memory_space,
+          /*device_layout=*/nullptr));
+  at::Tensor tpu_tensor =
+      ::torch::zeros({kMajor, kRows, kCols}, ::torch::kFloat32);
+  RegisterMockTensor(tpu_tensor, device_buffer.get());
+
+  auto transfer = std::make_shared<PreparedTorchRawTransferBatch>(
+      std::vector<at::Tensor>{tpu_tensor}, std::vector<int64_t>{kBytes},
+      /*unsafe_skip_buffer_lock=*/true);
+  ASSERT_EQ(transfer->HostDataPtrs().size(), 1);
+  ASSERT_EQ(transfer->HostSizeBytes(), std::vector<size_t>{kBytes});
+  ASSERT_NE(transfer->HostDataPtrs()[0], 0);
+
+  ASSERT_OK(transfer
+                ->D2HAsync(/*src_offsets_major_dim=*/{1},
+                           /*dst_offsets_major_dim=*/{2},
+                           /*copy_sizes_major_dim=*/{1})
+                .Await());
+  float* host = reinterpret_cast<float*>(transfer->HostDataPtrs()[0]);
+  for (int64_t i = 0; i < kSliceElements; ++i) {
+    EXPECT_EQ(host[2 * kSliceElements + i], initial[kSliceElements + i]);
+    host[2 * kSliceElements + i] = 17.0f;
+  }
+
+  ASSERT_OK(transfer
+                ->H2DAsync(/*src_offsets_major_dim=*/{2},
+                           /*dst_offsets_major_dim=*/{3},
+                           /*copy_sizes_major_dim=*/{1})
+                .Await());
+  std::vector<float> readback(kElements);
+  ASSERT_OK(device_buffer->CopyRawToHost(readback.data(), 0, kBytes).Await());
+  for (int64_t i = 0; i < kSliceElements; ++i) {
+    EXPECT_EQ(readback[3 * kSliceElements + i], 17.0f);
+  }
+}
+
 }  // namespace
 }  // namespace raiden

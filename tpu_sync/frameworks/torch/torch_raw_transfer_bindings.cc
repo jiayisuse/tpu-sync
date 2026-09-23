@@ -133,9 +133,22 @@ void BindTorchRawTransfer(nb::module_& m) {
            }),
            nb::arg("tpu_tensors"), nb::arg("host_tensors"),
            nb::arg("unsafe_skip_buffer_lock") = true)
+      .def(nb::new_([](const TensorList& tpu_tensors,
+                       const std::vector<int64_t>& host_buffer_sizes_bytes,
+                       bool unsafe_skip_buffer_lock) {
+             return std::make_shared<PreparedTorchRawTransferBatch>(
+                 tpu_tensors, host_buffer_sizes_bytes,
+                 unsafe_skip_buffer_lock);
+           }),
+           nb::arg("tpu_tensors"), nb::arg("host_buffer_sizes_bytes"),
+           nb::arg("unsafe_skip_buffer_lock") = true)
       .def("__len__", &PreparedTorchRawTransferBatch::Size)
       .def_prop_ro("physical_size_bytes",
                    &PreparedTorchRawTransferBatch::PhysicalSizeBytes)
+      .def_prop_ro("host_data_ptrs",
+                   &PreparedTorchRawTransferBatch::HostDataPtrs)
+      .def_prop_ro("host_size_bytes",
+                   &PreparedTorchRawTransferBatch::HostSizeBytes)
       .def("d2h_async", &PreparedTorchRawTransferBatch::D2HAsync,
            nb::arg("src_offsets_major_dim") = std::vector<int64_t>{},
            nb::arg("dst_offsets_major_dim") = std::vector<int64_t>{},

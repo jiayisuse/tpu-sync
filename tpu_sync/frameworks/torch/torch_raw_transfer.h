@@ -38,6 +38,7 @@ class RawHostBuffer {
   size_t SizeBytes() const;
   bool IsPjRtBacked() const;
   void EnsureBoundToDevice(xla::PjRtDevice* device);
+  void EnsureDmaMappedToDevice(xla::PjRtDevice* device);
 
  private:
   size_t size_bytes_ = 0;
@@ -77,8 +78,10 @@ class PreparedTorchRawTransfer
 // KV-cache paths that submit many small partial transfers against the same
 // long-lived tensors.
 //
-// Host tensors are retained for this object's lifetime and must be contiguous
-// CPU tensors. Pinned tensors avoid libtpu's pageable-memory staging fallback.
+// The caller may supply contiguous CPU host tensors, or byte sizes from which
+// this object allocates and owns device-local, PJRT DMA-mapped host buffers.
+// Supplied tensors are retained for this object's lifetime; pinned tensors
+// avoid libtpu's pageable-memory staging fallback.
 // When unsafe_skip_buffer_lock is false, a fresh PJRT usage hold is acquired
 // for each submitted copy and retained by its future until completion. When it
 // is true, only the owning tensor-buffer reference is retained.
@@ -88,12 +91,18 @@ class PreparedTorchRawTransferBatch
   PreparedTorchRawTransferBatch(const std::vector<at::Tensor>& tpu_tensors,
                                 const std::vector<at::Tensor>& host_tensors,
                                 bool unsafe_skip_buffer_lock);
+  PreparedTorchRawTransferBatch(
+      const std::vector<at::Tensor>& tpu_tensors,
+      const std::vector<int64_t>& host_buffer_sizes_bytes,
+      bool unsafe_skip_buffer_lock);
   PreparedTorchRawTransferBatch(const PreparedTorchRawTransferBatch&) = delete;
   PreparedTorchRawTransferBatch& operator=(
       const PreparedTorchRawTransferBatch&) = delete;
 
   size_t Size() const;
   std::vector<size_t> PhysicalSizeBytes() const;
+  std::vector<uintptr_t> HostDataPtrs() const;
+  std::vector<size_t> HostSizeBytes() const;
 
   PjRtCopyFuture D2HAsync(const std::vector<int64_t>& src_offsets_major_dim,
                           const std::vector<int64_t>& dst_offsets_major_dim,
@@ -112,10 +121,15 @@ class PreparedTorchRawTransferBatch
   };
 
   RaidenBufferHandle BufferForCopy(const PreparedBuffer& prepared) const;
+  void PrepareBuffers();
+  uint8_t* MutableHostData(size_t index) const;
+  const uint8_t* HostData(size_t index) const;
+  size_t HostSize(size_t index) const;
 
   std::vector<PreparedBuffer> prepared_buffers_;
   std::vector<at::Tensor> tpu_tensors_;
   std::vector<at::Tensor> host_tensors_;
+  std::vector<std::shared_ptr<RawHostBuffer>> host_buffers_;
   bool unsafe_skip_buffer_lock_ = false;
 };
 
