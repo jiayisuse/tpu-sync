@@ -322,6 +322,10 @@ nanobind_extension(
     visibility = ["//visibility:public"],
     deps = [
         ":torch_raw_transfer_bindings",
+        # XLA's PJRT headers use FlatBuffers APIs whose non-inline runtime
+        # symbols were previously pulled in transitively by the full Raiden
+        # extension. Keep the standalone raw-transfer module self-contained.
+        "@com_github_google_flatbuffers//:flatbuffers",
     ],
 )
 
