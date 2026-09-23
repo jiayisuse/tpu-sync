@@ -119,6 +119,34 @@ NB_MODULE(_torch_raw_transfer, m) {
       .def("h2d", &PreparedTorchRawTransfer::H2D,
            nb::call_guard<nb::gil_scoped_release>());
 
+  nb::class_<PreparedTorchRawTransferBatch>(m, "PreparedTorchRawTransferBatch")
+      .def(nb::new_([](const TensorList& tpu_tensors,
+                       const std::vector<int64_t>& host_buffer_sizes_bytes,
+                       bool unsafe_skip_buffer_lock) {
+             return std::make_shared<PreparedTorchRawTransferBatch>(
+                 tpu_tensors, host_buffer_sizes_bytes,
+                 unsafe_skip_buffer_lock);
+           }),
+           nb::arg("tpu_tensors"), nb::arg("host_buffer_sizes_bytes"),
+           nb::arg("unsafe_skip_buffer_lock") = true)
+      .def("__len__", &PreparedTorchRawTransferBatch::Size)
+      .def_prop_ro("physical_size_bytes",
+                   &PreparedTorchRawTransferBatch::PhysicalSizeBytes)
+      .def_prop_ro("host_data_ptrs",
+                   &PreparedTorchRawTransferBatch::HostDataPtrs)
+      .def_prop_ro("host_size_bytes",
+                   &PreparedTorchRawTransferBatch::HostSizeBytes)
+      .def("d2h_async", &PreparedTorchRawTransferBatch::D2HAsync,
+           nb::arg("src_offsets_major_dim") = std::vector<int64_t>{},
+           nb::arg("dst_offsets_major_dim") = std::vector<int64_t>{},
+           nb::arg("copy_sizes_major_dim") = std::vector<int64_t>{},
+           nb::call_guard<nb::gil_scoped_release>())
+      .def("h2d_async", &PreparedTorchRawTransferBatch::H2DAsync,
+           nb::arg("src_offsets_major_dim") = std::vector<int64_t>{},
+           nb::arg("dst_offsets_major_dim") = std::vector<int64_t>{},
+           nb::arg("copy_sizes_major_dim") = std::vector<int64_t>{},
+           nb::call_guard<nb::gil_scoped_release>());
+
   m.def("await_all", &AwaitAll, nb::arg("futures"));
   m.def("is_ready", &IsReady, nb::arg("futures"));
 

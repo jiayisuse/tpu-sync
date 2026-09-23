@@ -306,6 +306,7 @@ nanobind_extension(
         "//tpu_sync/core:xla_raw_transfer_headers",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
+        "@com_github_google_flatbuffers//:flatbuffers",
         "@torch_tpu//shims/torch:aten_headers",
     ],
 )

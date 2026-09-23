@@ -134,6 +134,36 @@ void RawHostBuffer::EnsureBoundToDevice(xla::PjRtDevice* device) {
   data_ptr_ = data_.get();
 }
 
+void RawHostBuffer::EnsureDmaMappedToDevice(xla::PjRtDevice* device) {
+  if (data_ptr_ != nullptr || size_bytes_ == 0) {
+    return;
+  }
+  if (device == nullptr) {
+    throw std::invalid_argument("Cannot DMA-map RawHostBuffer to null device");
+  }
+  auto allocator_or = tpu_raiden::HostMemoryAllocator::Create(device->client());
+  if (!allocator_or.ok()) {
+    throw std::runtime_error("Failed to create TPU DMA host allocator: " +
+                             allocator_or.status().ToString());
+  }
+  auto allocator = std::move(allocator_or).value();
+  auto status_or_alloc =
+      allocator->AllocateDmaMappedForDevice(size_bytes_, device);
+  if (!status_or_alloc.ok()) {
+    throw std::runtime_error("Failed to allocate TPU DMA-mapped host buffer: " +
+                             status_or_alloc.status().ToString());
+  }
+  auto alloc = std::move(status_or_alloc).value();
+  auto* ctx = new std::shared_ptr<tpu_raiden::HostBufferAllocation>(
+      std::make_shared<tpu_raiden::HostBufferAllocation>(std::move(alloc)));
+  data_ = c10::DataPtr((*ctx)->ptr, ctx, &DeleteHostBufferAllocation,
+                       c10::Device(c10::DeviceType::CPU));
+  if (data_.get() == nullptr) {
+    throw std::runtime_error("Failed to allocate TPU DMA-mapped host buffer");
+  }
+  data_ptr_ = data_.get();
+}
+
 namespace {
 [[noreturn]] void ThrowStatus(absl::string_view context,
                               const absl::Status& status) {
@@ -440,6 +470,129 @@ void PreparedTorchRawTransfer::H2D() {
   if (!status.ok()) {
     ThrowStatus("H2D copy failed", status);
   }
+}
+
+PreparedTorchRawTransferBatch::PreparedTorchRawTransferBatch(
+    const TensorList& tpu_tensors,
+    const std::vector<int64_t>& host_buffer_sizes_bytes,
+    bool unsafe_skip_buffer_lock)
+    : unsafe_skip_buffer_lock_(unsafe_skip_buffer_lock) {
+  if (tpu_tensors.empty()) {
+    throw std::invalid_argument("tpu_tensors must not be empty");
+  }
+  if (tpu_tensors.size() != host_buffer_sizes_bytes.size()) {
+    throw std::invalid_argument(
+        "Lengths of tpu_tensors and host_buffer_sizes_bytes must match");
+  }
+
+  prepared_buffers_.reserve(tpu_tensors.size());
+  host_buffers_.reserve(tpu_tensors.size());
+  for (size_t i = 0; i < tpu_tensors.size(); ++i) {
+    if (host_buffer_sizes_bytes[i] <= 0) {
+      throw std::invalid_argument(
+          "host_buffer_sizes_bytes must contain only positive values");
+    }
+
+    // Match the proven KVCacheManager lifetime model: retain the owning
+    // DeviceBufferRef, but do not retain an additional at::Tensor alias.
+    auto unpacked =
+        UnpackTorchTensor(tpu_tensors[i], /*unsafe_skip_buffer_lock=*/true);
+    auto host_buffer =
+        std::make_shared<RawHostBuffer>(host_buffer_sizes_bytes[i]);
+    host_buffer->EnsureDmaMappedToDevice(unpacked.buffer.device);
+    prepared_buffers_.push_back(PreparedBuffer{
+        .buffer = std::move(unpacked.buffer),
+        .buffer_ref = std::move(unpacked.ref),
+        .physical_size = unpacked.logical_physical_size,
+    });
+    host_buffers_.push_back(std::move(host_buffer));
+  }
+}
+
+size_t PreparedTorchRawTransferBatch::Size() const {
+  return prepared_buffers_.size();
+}
+
+std::vector<size_t> PreparedTorchRawTransferBatch::PhysicalSizeBytes() const {
+  std::vector<size_t> sizes;
+  sizes.reserve(prepared_buffers_.size());
+  for (const auto& prepared : prepared_buffers_) {
+    sizes.push_back(prepared.physical_size);
+  }
+  return sizes;
+}
+
+std::vector<uintptr_t> PreparedTorchRawTransferBatch::HostDataPtrs() const {
+  std::vector<uintptr_t> pointers;
+  pointers.reserve(host_buffers_.size());
+  for (const auto& host_buffer : host_buffers_) {
+    pointers.push_back(host_buffer->DataPtr());
+  }
+  return pointers;
+}
+
+std::vector<size_t> PreparedTorchRawTransferBatch::HostSizeBytes() const {
+  std::vector<size_t> sizes;
+  sizes.reserve(host_buffers_.size());
+  for (const auto& host_buffer : host_buffers_) {
+    sizes.push_back(host_buffer->SizeBytes());
+  }
+  return sizes;
+}
+
+RaidenBufferHandle PreparedTorchRawTransferBatch::BufferForCopy(
+    const PreparedBuffer& prepared) const {
+  if (unsafe_skip_buffer_lock_) {
+    return prepared.buffer;
+  }
+  if (prepared.buffer.buffer == nullptr) {
+    throw std::runtime_error(
+        "Prepared TPU buffer cannot acquire a per-copy usage hold");
+  }
+  return ValueOrThrow(
+      "Failed to acquire TPU buffer for prepared copy",
+      RaidenBufferHandle::Acquire(prepared.buffer.buffer,
+                                  /*c_api=*/nullptr,
+                                  /*extension=*/nullptr,
+                                  /*unsafe_skip_buffer_lock=*/false));
+}
+
+PjRtCopyFuture PreparedTorchRawTransferBatch::D2HAsync(
+    const std::vector<int64_t>& src_offsets_major_dim,
+    const std::vector<int64_t>& dst_offsets_major_dim,
+    const std::vector<int64_t>& copy_sizes_major_dim) {
+  tpu_raiden::ValidatePartialSpec(src_offsets_major_dim, dst_offsets_major_dim,
+                                  copy_sizes_major_dim);
+  std::vector<PjRtCopyFuture> futures;
+  futures.reserve(prepared_buffers_.size());
+  auto self = shared_from_this();
+  for (size_t i = 0; i < prepared_buffers_.size(); ++i) {
+    RaidenBufferHandle buffer = BufferForCopy(prepared_buffers_[i]);
+    futures.push_back(IssueD2HCopy(
+        buffer, static_cast<uint8_t*>(host_buffers_[i]->MutableData()),
+        host_buffers_[i]->SizeBytes(), src_offsets_major_dim,
+        dst_offsets_major_dim, copy_sizes_major_dim, self));
+  }
+  return JoinPjRtCopyFutures(absl::MakeSpan(futures));
+}
+
+PjRtCopyFuture PreparedTorchRawTransferBatch::H2DAsync(
+    const std::vector<int64_t>& src_offsets_major_dim,
+    const std::vector<int64_t>& dst_offsets_major_dim,
+    const std::vector<int64_t>& copy_sizes_major_dim) {
+  tpu_raiden::ValidatePartialSpec(src_offsets_major_dim, dst_offsets_major_dim,
+                                  copy_sizes_major_dim);
+  std::vector<PjRtCopyFuture> futures;
+  futures.reserve(prepared_buffers_.size());
+  auto self = shared_from_this();
+  for (size_t i = 0; i < prepared_buffers_.size(); ++i) {
+    RaidenBufferHandle buffer = BufferForCopy(prepared_buffers_[i]);
+    futures.push_back(IssueH2DCopy(
+        static_cast<const uint8_t*>(host_buffers_[i]->Data()),
+        host_buffers_[i]->SizeBytes(), buffer, src_offsets_major_dim,
+        dst_offsets_major_dim, copy_sizes_major_dim, self));
+  }
+  return JoinPjRtCopyFutures(absl::MakeSpan(futures));
 }
 
 }  // namespace raiden

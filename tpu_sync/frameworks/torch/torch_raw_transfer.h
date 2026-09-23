@@ -17,6 +17,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include "ATen/core/TensorBody.h"
@@ -37,6 +38,7 @@ class RawHostBuffer {
   size_t SizeBytes() const;
   bool IsPjRtBacked() const;
   void EnsureBoundToDevice(xla::PjRtDevice* device);
+  void EnsureDmaMappedToDevice(xla::PjRtDevice* device);
 
  private:
   size_t size_bytes_ = 0;
@@ -67,6 +69,48 @@ class PreparedTorchRawTransfer
   std::optional<torch_tpu::DeviceBufferRef> buffer_ref_;
   size_t physical_size_ = 0;
   RaidenBufferHandle buffer_;
+};
+
+// Prepared partial-copy engine for a fixed set of TPU tensors and owned,
+// device-local DMA-mapped host buffers. Construction resolves each TPU tensor
+// once and retains only its DeviceBufferRef, matching the lifetime behavior of
+// the proven KVCacheManager path without retaining additional at::Tensor
+// aliases that could inhibit later buffer donation.
+class PreparedTorchRawTransferBatch
+    : public std::enable_shared_from_this<PreparedTorchRawTransferBatch> {
+ public:
+  PreparedTorchRawTransferBatch(
+      const std::vector<at::Tensor>& tpu_tensors,
+      const std::vector<int64_t>& host_buffer_sizes_bytes,
+      bool unsafe_skip_buffer_lock);
+  PreparedTorchRawTransferBatch(const PreparedTorchRawTransferBatch&) = delete;
+  PreparedTorchRawTransferBatch& operator=(
+      const PreparedTorchRawTransferBatch&) = delete;
+
+  size_t Size() const;
+  std::vector<size_t> PhysicalSizeBytes() const;
+  std::vector<uintptr_t> HostDataPtrs() const;
+  std::vector<size_t> HostSizeBytes() const;
+
+  PjRtCopyFuture D2HAsync(const std::vector<int64_t>& src_offsets_major_dim,
+                          const std::vector<int64_t>& dst_offsets_major_dim,
+                          const std::vector<int64_t>& copy_sizes_major_dim);
+  PjRtCopyFuture H2DAsync(const std::vector<int64_t>& src_offsets_major_dim,
+                          const std::vector<int64_t>& dst_offsets_major_dim,
+                          const std::vector<int64_t>& copy_sizes_major_dim);
+
+ private:
+  struct PreparedBuffer {
+    RaidenBufferHandle buffer;
+    std::optional<torch_tpu::DeviceBufferRef> buffer_ref;
+    size_t physical_size = 0;
+  };
+
+  RaidenBufferHandle BufferForCopy(const PreparedBuffer& prepared) const;
+
+  std::vector<PreparedBuffer> prepared_buffers_;
+  std::vector<std::shared_ptr<RawHostBuffer>> host_buffers_;
+  bool unsafe_skip_buffer_lock_ = false;
 };
 
 PjRtCopyFuture TransferD2HBatchAsync(
