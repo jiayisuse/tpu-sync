@@ -99,4 +99,19 @@ const PJRT_RawBuffer_Extension* GetRawBufferExtension(
       PJRT_Extension_Type::PJRT_Extension_Type_RawBuffer);
 }
 
+absl::StatusOr<CApiClientHandles> GetCApiClientHandles(
+    const xla::PjRtBuffer* buffer) {
+  auto* capi_buffer = dynamic_cast<const xla::PjRtCApiBuffer*>(buffer);
+  if (capi_buffer == nullptr) {
+    return absl::InvalidArgumentError("Not a PjRtCApiBuffer");
+  }
+  auto* capi_client = dynamic_cast<xla::PjRtCApiClient*>(
+      const_cast<xla::PjRtClient*>(capi_buffer->client()));
+  if (capi_client == nullptr) {
+    return absl::InternalError("PjRtCApiBuffer has no PjRtCApiClient");
+  }
+  return CApiClientHandles{.api = capi_client->pjrt_c_api(),
+                           .client = capi_client->pjrt_c_client()};
+}
+
 }  // namespace raiden

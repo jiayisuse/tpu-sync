@@ -106,6 +106,17 @@ absl::StatusOr<PJRT_RawBuffer*> CreateCApiRawAlias(
 const PJRT_RawBuffer_Extension* GetRawBufferExtension(
     const xla::PjRtBuffer* buffer, const PJRT_Api** out_c_api = nullptr);
 
+// Stable C-API handles owned by the live PJRT client behind a C-API buffer.
+// These let independently built compatibility extensions call versioned PJRT
+// operations without dispatching through the C++ PjRtClient vtable.
+struct CApiClientHandles {
+  const PJRT_Api* api = nullptr;
+  PJRT_Client* client = nullptr;
+};
+
+absl::StatusOr<CApiClientHandles> GetCApiClientHandles(
+    const xla::PjRtBuffer* buffer);
+
 }  // namespace raiden
 
 #endif  // THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_CORE_XLA_COMPAT_H_

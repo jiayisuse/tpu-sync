@@ -30,7 +30,7 @@ namespace raiden {
 class RawHostBuffer {
  public:
   explicit RawHostBuffer(int64_t size_bytes);
-  ~RawHostBuffer() = default;
+  ~RawHostBuffer();
 
   uintptr_t DataPtr() const;
   void* MutableData() const;
@@ -39,12 +39,15 @@ class RawHostBuffer {
   bool IsPjRtBacked() const;
   void EnsureBoundToDevice(xla::PjRtDevice* device);
   void EnsureDmaMappedToDevice(xla::PjRtDevice* device);
+  void EnsureDmaMappedToBuffer(xla::PjRtBuffer* buffer);
 
  private:
   size_t size_bytes_ = 0;
+  size_t mapped_size_bytes_ = 0;
   void* data_ptr_ = nullptr;
-  std::unique_ptr<xla::PjRtBuffer> pjrt_buffer_;
-  c10::DataPtr data_;
+  const PJRT_Api* c_api_ = nullptr;
+  PJRT_Client* c_client_ = nullptr;
+  at::Tensor host_tensor_;
 };
 
 class PreparedTorchRawTransfer
@@ -104,6 +107,7 @@ class PreparedTorchRawTransferBatch
     RaidenBufferHandle buffer;
     std::optional<torch_tpu::DeviceBufferRef> buffer_ref;
     size_t physical_size = 0;
+    size_t slice_byte_size = 0;
   };
 
   RaidenBufferHandle BufferForCopy(const PreparedBuffer& prepared) const;

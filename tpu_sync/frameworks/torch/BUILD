@@ -275,7 +275,6 @@ cc_library(
         ":torch_tpu_device_buffer_headers",
         ":torch_tpu_tensor_to_buffer_headers",
         ":torch_tpu_utils",
-        "//tpu_sync/core:host_memory_allocator",
         "//tpu_sync/core:raw_transfer_core",
         "//tpu_sync/core:utils",
         "//tpu_sync/core:xla_raw_transfer_headers",
@@ -300,7 +299,6 @@ nanobind_extension(
     deps = [
         ":torch_nanobind_utils",
         ":torch_raw_transfer_torch",
-        "//tpu_sync/core:host_memory_allocator",
         "//tpu_sync/core:raw_transfer_core",
         "//tpu_sync/core:utils",
         "//tpu_sync/core:xla_raw_transfer_headers",
@@ -327,7 +325,6 @@ cc_library(
         ":torch_tpu_device_buffer_headers",
         ":torch_tpu_tensor_to_buffer_headers",
         ":torch_tpu_utils_mock",
-        "//tpu_sync/core:host_memory_allocator",
         "//tpu_sync/core:raw_transfer_core",
         "//tpu_sync/core:utils",
         "//tpu_sync/core:xla_raw_transfer_headers",

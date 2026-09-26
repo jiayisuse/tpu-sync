@@ -23,7 +23,11 @@ class DeviceBufferRef {
   DeviceBufferRef(DeviceBufferRef&&) noexcept = default;
   DeviceBufferRef& operator=(const DeviceBufferRef&) = default;
   DeviceBufferRef& operator=(DeviceBufferRef&&) noexcept = default;
-  ~DeviceBufferRef();
+  // The August 2026 wheel exports only the base-object destructor (D2), not
+  // the complete-object destructor (D1). Defaulting this non-polymorphic
+  // value type inline avoids an unavailable D1 ABI reference while retaining
+  // the shared_ptr lifetime behavior used by the released extension.
+  ~DeviceBufferRef() = default;
 
   absl::Span<const int64_t> dimensions() const;
   size_t size_bytes() const;

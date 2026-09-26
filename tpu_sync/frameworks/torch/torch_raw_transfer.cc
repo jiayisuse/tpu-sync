@@ -16,18 +16,28 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cerrno>
+#include <cstring>
 #include <memory>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
 
+#if defined(__linux__)
+#include <linux/mempolicy.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
+
 #include "ATen/core/TensorBody.h"
+#include "ATen/ops/empty.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
-#include "c10/core/Device.h"
 #include "torch/headeronly/core/DeviceType.h"
 #include "torch_tpu/csrc/eager/device_buffer.h"
 #include "xla/future.h"
@@ -35,7 +45,6 @@
 #include "xla/pjrt/pjrt_client.h"
 #include "xla/shape.h"
 #include "xla/shape_util.h"
-#include "tpu_sync/core/host_memory_allocator.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/core/utils.h"
 #include "tpu_sync/frameworks/torch/torch_tpu_utils.h"
@@ -47,9 +56,34 @@ using TensorList = std::vector<at::Tensor>;
 
 using ::tpu_raiden::torch::UnpackTorchTensor;
 
-void DeleteHostBufferAllocation(void* ctx) {
-  delete static_cast<std::shared_ptr<tpu_raiden::HostBufferAllocation>*>(ctx);
-}
+class ScopedNumaBind {
+ public:
+  explicit ScopedNumaBind(int numa_node) {
+#if defined(__linux__) && defined(SYS_set_mempolicy)
+    unsigned long mask = 1UL << numa_node;
+    if (syscall(SYS_set_mempolicy, MPOL_BIND, &mask,
+                sizeof(mask) * 8) != 0) {
+      throw std::runtime_error(absl::StrCat(
+          "Failed to bind staging allocation to NUMA node ", numa_node,
+          ": ", std::strerror(errno)));
+    }
+    active_ = true;
+#else
+    (void)numa_node;
+#endif
+  }
+
+  ~ScopedNumaBind() {
+#if defined(__linux__) && defined(SYS_set_mempolicy)
+    if (active_) {
+      (void)syscall(SYS_set_mempolicy, MPOL_DEFAULT, nullptr, 0);
+    }
+#endif
+  }
+
+ private:
+  bool active_ = false;
+};
 }  // namespace
 
 RawHostBuffer::RawHostBuffer(int64_t size_bytes) {
@@ -58,6 +92,25 @@ RawHostBuffer::RawHostBuffer(int64_t size_bytes) {
         "RawHostBuffer size_bytes must be non-negative");
   }
   size_bytes_ = static_cast<size_t>(size_bytes);
+}
+
+RawHostBuffer::~RawHostBuffer() {
+  if (c_api_ != nullptr && c_client_ != nullptr && data_ptr_ != nullptr) {
+    PJRT_Client_DmaUnmap_Args args;
+    args.struct_size = PJRT_Client_DmaUnmap_Args_STRUCT_SIZE;
+    args.extension_start = nullptr;
+    args.client = c_client_;
+    args.data = data_ptr_;
+    PJRT_Error* error = c_api_->PJRT_Client_DmaUnmap(&args);
+    if (error != nullptr) {
+      (void)PjrtErrorToStatusLocal(c_api_, error);
+    }
+  }
+#if defined(__linux__)
+  if (mapped_size_bytes_ != 0 && data_ptr_ != nullptr) {
+    (void)munmap(data_ptr_, mapped_size_bytes_);
+  }
+#endif
 }
 
 uintptr_t RawHostBuffer::DataPtr() const {
@@ -70,7 +123,9 @@ const void* RawHostBuffer::Data() const { return data_ptr_; }
 
 size_t RawHostBuffer::SizeBytes() const { return size_bytes_; }
 
-bool RawHostBuffer::IsPjRtBacked() const { return pjrt_buffer_ != nullptr; }
+bool RawHostBuffer::IsPjRtBacked() const {
+  return c_client_ != nullptr || host_tensor_.defined();
+}
 
 void RawHostBuffer::EnsureBoundToDevice(xla::PjRtDevice* device) {
   if (data_ptr_ != nullptr || size_bytes_ == 0) {
@@ -79,89 +134,99 @@ void RawHostBuffer::EnsureBoundToDevice(xla::PjRtDevice* device) {
   if (device == nullptr) {
     throw std::invalid_argument("Cannot bind RawHostBuffer to null device");
   }
-  xla::PjRtMemorySpace* pinned_host = nullptr;
-  auto memory_or = device->memory_space_by_kind("pinned_host");
-  if (memory_or.ok()) {
-    pinned_host = memory_or.value();
-  } else {
-    for (xla::PjRtMemorySpace* memory : device->memory_spaces()) {
-      std::string kind(memory->kind());
-      if (kind == "pinned_host" || kind == "PINNED_HOST") {
-        pinned_host = memory;
-        break;
-      }
-    }
-  }
+  // TPU v7x staging DMA is local to NUMA node 0 on the serving hosts. Match
+  // XlaHostMemoryAllocator's placement while staying on the stable ATen ABI.
+  ScopedNumaBind numa_policy(/*numa_node=*/0);
 
-  if (pinned_host != nullptr) {
-    xla::Shape shape =
-        xla::ShapeUtil::MakeShape(xla::U8, {static_cast<int64_t>(size_bytes_)});
-    auto buffer_or =
-        device->client()->CreateUninitializedBuffer(shape, pinned_host);
-    if (buffer_or.ok()) {
-      pjrt_buffer_ = std::move(buffer_or.value());
-      auto ptr_or =
-          pjrt_buffer_->client()->UnsafeBufferPointer(pjrt_buffer_.get());
-      if (!ptr_or.ok()) {
-        throw std::runtime_error(
-            std::string("Failed to get pinned host buffer pointer: ") +
-            std::string(ptr_or.status().message()));
-      }
-      data_ptr_ = reinterpret_cast<void*>(ptr_or.value());
-      return;
-    }
+  // Allocate through Torch-Tpu's registered pinned-CPU allocator.  The
+  // standalone extension is built against an XLA source snapshot, while the
+  // serving wheel owns the live PJRT client; calling that client's evolving
+  // C++ virtual allocation API from this DSO is not ABI-safe.  ATen's tensor
+  // ABI is the stable boundary already used by the serving runtime, and the
+  // tensor retained here owns the registered host allocation for every DMA.
+  host_tensor_ = at::empty(
+      {static_cast<int64_t>(size_bytes_)},
+      at::TensorOptions()
+          .dtype(at::ScalarType::Byte)
+          .device(at::DeviceType::CPU)
+          .pinned_memory(true));
+  if (!host_tensor_.defined() || host_tensor_.data_ptr() == nullptr) {
+    throw std::runtime_error("Failed to allocate Torch-TPU pinned host buffer");
   }
+  data_ptr_ = host_tensor_.data_ptr();
 
-  auto allocator_or = tpu_raiden::HostMemoryAllocator::Create(device->client());
-  if (!allocator_or.ok()) {
-    throw std::runtime_error("Failed to create TPU pinned host allocator: " +
-                             allocator_or.status().ToString());
+  // Match XlaHostMemoryAllocator's one-time first-touch behavior.  at::empty
+  // reserves the pinned arena but leaves its pages physically uncommitted;
+  // without this pass the first request to use each staging range pays page
+  // faults on the latency-critical D2H/H2D path.  Touch one byte per page so
+  // those faults are absorbed during initialization instead.
+  volatile uint8_t* pages = static_cast<volatile uint8_t*>(data_ptr_);
+  constexpr size_t kPageSize = 4096;
+  for (size_t offset = 0; offset < size_bytes_; offset += kPageSize) {
+    pages[offset] = 0;
   }
-  auto allocator = std::move(allocator_or).value();
-  auto status_or_alloc = allocator->Allocate(size_bytes_);
-  if (!status_or_alloc.ok()) {
-    throw std::runtime_error("Failed to allocate TPU pinned host buffer: " +
-                             status_or_alloc.status().ToString());
-  }
-  auto alloc = std::move(status_or_alloc).value();
-  auto* ctx = new std::shared_ptr<tpu_raiden::HostBufferAllocation>(
-      std::make_shared<tpu_raiden::HostBufferAllocation>(std::move(alloc)));
-  data_ = c10::DataPtr((*ctx)->ptr, ctx, &DeleteHostBufferAllocation,
-                       c10::Device(c10::DeviceType::CPU));
-  if (data_.get() == nullptr) {
-    throw std::runtime_error("Failed to allocate TPU pinned host buffer");
-  }
-  data_ptr_ = data_.get();
 }
 
 void RawHostBuffer::EnsureDmaMappedToDevice(xla::PjRtDevice* device) {
+  EnsureBoundToDevice(device);
+}
+
+void RawHostBuffer::EnsureDmaMappedToBuffer(xla::PjRtBuffer* buffer) {
   if (data_ptr_ != nullptr || size_bytes_ == 0) {
     return;
   }
-  if (device == nullptr) {
-    throw std::invalid_argument("Cannot DMA-map RawHostBuffer to null device");
+  if (buffer == nullptr) {
+    throw std::invalid_argument("Cannot DMA-map RawHostBuffer for null buffer");
   }
-  auto allocator_or = tpu_raiden::HostMemoryAllocator::Create(device->client());
-  if (!allocator_or.ok()) {
-    throw std::runtime_error("Failed to create TPU DMA host allocator: " +
-                             allocator_or.status().ToString());
+
+  auto handles_or = GetCApiClientHandles(buffer);
+  if (!handles_or.ok()) {
+    // Retain a functional non-C-API fallback for CPU/unit-test buffers.
+    EnsureBoundToDevice(buffer->device());
+    return;
   }
-  auto allocator = std::move(allocator_or).value();
-  auto status_or_alloc =
-      allocator->AllocateDmaMappedForDevice(size_bytes_, device);
-  if (!status_or_alloc.ok()) {
-    throw std::runtime_error("Failed to allocate TPU DMA-mapped host buffer: " +
-                             status_or_alloc.status().ToString());
+
+#if defined(__linux__)
+  constexpr size_t kPageSize = 4096;
+  mapped_size_bytes_ = (size_bytes_ + kPageSize - 1) & ~(kPageSize - 1);
+  ScopedNumaBind numa_policy(/*numa_node=*/0);
+  data_ptr_ = mmap(nullptr, mapped_size_bytes_, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (data_ptr_ == MAP_FAILED) {
+    data_ptr_ = nullptr;
+    mapped_size_bytes_ = 0;
+    throw std::runtime_error(absl::StrCat(
+        "mmap failed for DMA staging buffer: ", std::strerror(errno)));
   }
-  auto alloc = std::move(status_or_alloc).value();
-  auto* ctx = new std::shared_ptr<tpu_raiden::HostBufferAllocation>(
-      std::make_shared<tpu_raiden::HostBufferAllocation>(std::move(alloc)));
-  data_ = c10::DataPtr((*ctx)->ptr, ctx, &DeleteHostBufferAllocation,
-                       c10::Device(c10::DeviceType::CPU));
-  if (data_.get() == nullptr) {
-    throw std::runtime_error("Failed to allocate TPU DMA-mapped host buffer");
+
+  c_api_ = handles_or->api;
+  c_client_ = handles_or->client;
+  PJRT_Client_DmaMap_Args args;
+  args.struct_size = PJRT_Client_DmaMap_Args_STRUCT_SIZE;
+  args.extension_start = nullptr;
+  args.client = c_client_;
+  args.data = data_ptr_;
+  args.size = mapped_size_bytes_;
+  if (PJRT_Error* error = c_api_->PJRT_Client_DmaMap(&args); error != nullptr) {
+    absl::Status status = PjrtErrorToStatusLocal(c_api_, error);
+    (void)munmap(data_ptr_, mapped_size_bytes_);
+    data_ptr_ = nullptr;
+    mapped_size_bytes_ = 0;
+    c_api_ = nullptr;
+    c_client_ = nullptr;
+    throw std::runtime_error(
+        absl::StrCat("PJRT C-API DmaMap failed: ", status.message()));
   }
-  data_ptr_ = data_.get();
+
+  // Match XlaHostMemoryAllocator: register first, then fault every page while
+  // the allocation thread is bound to the TPU-local NUMA node.
+  volatile uint8_t* pages = static_cast<volatile uint8_t*>(data_ptr_);
+  for (size_t offset = 0; offset < mapped_size_bytes_; offset += kPageSize) {
+    pages[offset] = 0;
+  }
+#else
+  EnsureBoundToDevice(buffer->device());
+#endif
 }
 
 namespace {
@@ -245,17 +310,30 @@ PjRtCopyFuture IssueD2HCopy(const RaidenBufferHandle& src_buffer,
                             const std::vector<int64_t>& src_offsets_major_dim,
                             const std::vector<int64_t>& dst_offsets_major_dim,
                             const std::vector<int64_t>& copy_sizes_major_dim,
-                            std::shared_ptr<void> user_hold = nullptr) {
-  ValidateMajorDimLayout(src_buffer, "Source");
+                            std::shared_ptr<void> user_hold = nullptr,
+                            std::optional<int64_t> prepared_physical_size =
+                                std::nullopt,
+                            std::optional<int64_t> prepared_slice_byte_size =
+                                std::nullopt) {
+  if (!prepared_physical_size.has_value() ||
+      !prepared_slice_byte_size.has_value()) {
+    ValidateMajorDimLayout(src_buffer, "Source");
+  }
   const bool is_partial =
       tpu_raiden::IsPartialCopy(src_buffer.shape, src_offsets_major_dim,
                                 dst_offsets_major_dim, copy_sizes_major_dim);
-  const int64_t physical_size =
-      src_buffer.buffer
-          ? ValueOrThrow("Failed to get source physical buffer size",
-                         src_buffer.buffer->GetOnDeviceSizeInBytes())
-          : xla::ShapeUtil::ByteSizeOf(src_buffer.shape);
-  const int64_t slice_byte_size = GetMajorSliceByteSize(src_buffer.shape);
+  const int64_t physical_size = prepared_physical_size.has_value()
+                                    ? *prepared_physical_size
+                                    : src_buffer.buffer
+                                          ? ValueOrThrow(
+                                                "Failed to get source physical buffer size",
+                                                src_buffer.buffer
+                                                    ->GetOnDeviceSizeInBytes())
+                                          : xla::ShapeUtil::ByteSizeOf(
+                                                src_buffer.shape);
+  const int64_t slice_byte_size = prepared_slice_byte_size.has_value()
+                                      ? *prepared_slice_byte_size
+                                      : GetMajorSliceByteSize(src_buffer.shape);
 
   if (is_partial) {
     tpu_raiden::ValidatePartialAlignment(src_buffer.shape, slice_byte_size);
@@ -284,17 +362,30 @@ PjRtCopyFuture IssueH2DCopy(const uint8_t* src_data, size_t src_size,
                             const std::vector<int64_t>& src_offsets_major_dim,
                             const std::vector<int64_t>& dst_offsets_major_dim,
                             const std::vector<int64_t>& copy_sizes_major_dim,
-                            std::shared_ptr<void> user_hold = nullptr) {
-  ValidateMajorDimLayout(dst_buffer, "Destination");
+                            std::shared_ptr<void> user_hold = nullptr,
+                            std::optional<int64_t> prepared_physical_size =
+                                std::nullopt,
+                            std::optional<int64_t> prepared_slice_byte_size =
+                                std::nullopt) {
+  if (!prepared_physical_size.has_value() ||
+      !prepared_slice_byte_size.has_value()) {
+    ValidateMajorDimLayout(dst_buffer, "Destination");
+  }
   const bool is_partial =
       tpu_raiden::IsPartialCopy(dst_buffer.shape, src_offsets_major_dim,
                                 dst_offsets_major_dim, copy_sizes_major_dim);
-  const int64_t physical_size =
-      dst_buffer.buffer
-          ? ValueOrThrow("Failed to get destination physical buffer size",
-                         dst_buffer.buffer->GetOnDeviceSizeInBytes())
-          : xla::ShapeUtil::ByteSizeOf(dst_buffer.shape);
-  const int64_t slice_byte_size = GetMajorSliceByteSize(dst_buffer.shape);
+  const int64_t physical_size = prepared_physical_size.has_value()
+                                    ? *prepared_physical_size
+                                    : dst_buffer.buffer
+                                          ? ValueOrThrow(
+                                                "Failed to get destination physical buffer size",
+                                                dst_buffer.buffer
+                                                    ->GetOnDeviceSizeInBytes())
+                                          : xla::ShapeUtil::ByteSizeOf(
+                                                dst_buffer.shape);
+  const int64_t slice_byte_size = prepared_slice_byte_size.has_value()
+                                      ? *prepared_slice_byte_size
+                                      : GetMajorSliceByteSize(dst_buffer.shape);
 
   if (is_partial) {
     tpu_raiden::ValidatePartialAlignment(dst_buffer.shape, slice_byte_size);
@@ -419,7 +510,7 @@ PreparedTorchRawTransfer::PreparedTorchRawTransfer(
   auto unpacked = UnpackTorchTensor(tpu_tensor, unsafe_skip_buffer_lock);
   buffer_ = std::move(unpacked.buffer);
   buffer_ref_ = std::move(unpacked.ref);  // keep the materialized buffer alive
-  host_buffer_->EnsureBoundToDevice(buffer_.device);
+  host_buffer_->EnsureDmaMappedToBuffer(buffer_.buffer);
   physical_size_ = static_cast<size_t>(
       ValueOrThrow("Failed to get TPU physical buffer size",
                    buffer_.buffer ? buffer_.buffer->GetOnDeviceSizeInBytes()
@@ -493,19 +584,42 @@ PreparedTorchRawTransferBatch::PreparedTorchRawTransferBatch(
           "host_buffer_sizes_bytes must contain only positive values");
     }
 
-    // Match the proven KVCacheManager lifetime model: retain the owning
-    // DeviceBufferRef, but do not retain an additional at::Tensor alias.
-    auto unpacked =
-        UnpackTorchTensor(tpu_tensors[i], /*unsafe_skip_buffer_lock=*/true);
-    auto host_buffer =
-        std::make_shared<RawHostBuffer>(host_buffer_sizes_bytes[i]);
-    host_buffer->EnsureDmaMappedToDevice(unpacked.buffer.device);
-    prepared_buffers_.push_back(PreparedBuffer{
-        .buffer = std::move(unpacked.buffer),
-        .buffer_ref = std::move(unpacked.ref),
-        .physical_size = unpacked.logical_physical_size,
-    });
-    host_buffers_.push_back(std::move(host_buffer));
+    const char* stage = "unpack TPU tensor";
+    try {
+      // Match the proven KVCacheManager lifetime model: retain the owning
+      // DeviceBufferRef, but do not retain an additional at::Tensor alias.
+      auto unpacked =
+          UnpackTorchTensor(tpu_tensors[i], /*unsafe_skip_buffer_lock=*/true);
+      stage = "construct host-buffer owner";
+      auto host_buffer =
+          std::make_shared<RawHostBuffer>(host_buffer_sizes_bytes[i]);
+      stage = "allocate and C-API DMA-map host buffer";
+      // Duplicate XlaHostMemoryAllocator through the stable PJRT C ABI. This
+      // avoids the independently linked PjRtClient C++ vtable while preserving
+      // the proven mmap + explicit DmaMap staging semantics.
+      host_buffer->EnsureDmaMappedToBuffer(unpacked.buffer.buffer);
+      stage = "validate and cache prepared buffer geometry";
+      ValidateMajorDimLayout(unpacked.buffer, "Prepared TPU buffer");
+      const size_t prepared_physical_size =
+          unpacked.buffer.GetOnDeviceSizeInBytes();
+      const size_t prepared_slice_byte_size =
+          static_cast<size_t>(GetMajorSliceByteSize(unpacked.buffer.shape));
+      stage = "retain prepared buffer";
+      prepared_buffers_.push_back(PreparedBuffer{
+          .buffer = std::move(unpacked.buffer),
+          .buffer_ref = std::move(unpacked.ref),
+          .physical_size = prepared_physical_size,
+          .slice_byte_size = prepared_slice_byte_size,
+      });
+      stage = "retain host buffer";
+      host_buffers_.push_back(std::move(host_buffer));
+    } catch (const std::bad_alloc&) {
+      throw std::runtime_error(absl::StrCat(
+          "Prepared raw DMA batch ran out of memory while attempting to ",
+          stage, "; buffer_index=", i,
+          " host_bytes=", host_buffer_sizes_bytes[i],
+          " batch_buffers=", tpu_tensors.size()));
+    }
   }
 }
 
@@ -571,7 +685,9 @@ PjRtCopyFuture PreparedTorchRawTransferBatch::D2HAsync(
     futures.push_back(IssueD2HCopy(
         buffer, static_cast<uint8_t*>(host_buffers_[i]->MutableData()),
         host_buffers_[i]->SizeBytes(), src_offsets_major_dim,
-        dst_offsets_major_dim, copy_sizes_major_dim, self));
+        dst_offsets_major_dim, copy_sizes_major_dim, self,
+        static_cast<int64_t>(prepared_buffers_[i].physical_size),
+        static_cast<int64_t>(prepared_buffers_[i].slice_byte_size)));
   }
   return JoinPjRtCopyFutures(absl::MakeSpan(futures));
 }
@@ -590,7 +706,9 @@ PjRtCopyFuture PreparedTorchRawTransferBatch::H2DAsync(
     futures.push_back(IssueH2DCopy(
         static_cast<const uint8_t*>(host_buffers_[i]->Data()),
         host_buffers_[i]->SizeBytes(), buffer, src_offsets_major_dim,
-        dst_offsets_major_dim, copy_sizes_major_dim, self));
+        dst_offsets_major_dim, copy_sizes_major_dim, self,
+        static_cast<int64_t>(prepared_buffers_[i].physical_size),
+        static_cast<int64_t>(prepared_buffers_[i].slice_byte_size)));
   }
   return JoinPjRtCopyFutures(absl::MakeSpan(futures));
 }
